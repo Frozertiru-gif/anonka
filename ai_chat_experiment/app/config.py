@@ -9,6 +9,8 @@ from .constants import (
     DEFAULT_MAX_CONTEXT_MESSAGES,
     DEFAULT_REPLY_DELAY_MAX,
     DEFAULT_REPLY_DELAY_MIN,
+    DEFAULT_XAI_BASE_URL,
+    DEFAULT_XAI_TIMEOUT_SECONDS,
 )
 
 
@@ -19,8 +21,9 @@ class Settings:
     tg_session_name: str
     tg_target_username: str
     xai_api_key: str
-    xai_base_url: str
-    xai_model: str
+    xai_base_url: str = DEFAULT_XAI_BASE_URL
+    xai_model: str = "grok-3-mini"
+    xai_timeout_seconds: int = DEFAULT_XAI_TIMEOUT_SECONDS
     reply_delay_min: int = DEFAULT_REPLY_DELAY_MIN
     reply_delay_max: int = DEFAULT_REPLY_DELAY_MAX
     max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES
@@ -66,7 +69,17 @@ def _get_required_str(name: str) -> str:
     return value
 
 
-def _validate_ranges(reply_delay_min: int, reply_delay_max: int, max_context_messages: int) -> None:
+def _get_optional_str(name: str, default: str) -> str:
+    value = os.getenv(name, "").strip()
+    return value or default
+
+
+def _validate_ranges(
+    reply_delay_min: int,
+    reply_delay_max: int,
+    max_context_messages: int,
+    xai_timeout_seconds: int,
+) -> None:
     if reply_delay_min < 0:
         raise ConfigError("REPLY_DELAY_MIN must be >= 0")
     if reply_delay_max < 0:
@@ -75,6 +88,8 @@ def _validate_ranges(reply_delay_min: int, reply_delay_max: int, max_context_mes
         raise ConfigError("REPLY_DELAY_MIN cannot be greater than REPLY_DELAY_MAX")
     if max_context_messages <= 0:
         raise ConfigError("MAX_CONTEXT_MESSAGES must be > 0")
+    if xai_timeout_seconds <= 0:
+        raise ConfigError("XAI_TIMEOUT_SECONDS must be > 0")
 
 
 @lru_cache(maxsize=1)
@@ -85,8 +100,9 @@ def get_settings() -> Settings:
     reply_delay_min = _parse_int("REPLY_DELAY_MIN", DEFAULT_REPLY_DELAY_MIN)
     reply_delay_max = _parse_int("REPLY_DELAY_MAX", DEFAULT_REPLY_DELAY_MAX)
     max_context_messages = _parse_int("MAX_CONTEXT_MESSAGES", DEFAULT_MAX_CONTEXT_MESSAGES)
+    xai_timeout_seconds = _parse_int("XAI_TIMEOUT_SECONDS", DEFAULT_XAI_TIMEOUT_SECONDS)
 
-    _validate_ranges(reply_delay_min, reply_delay_max, max_context_messages)
+    _validate_ranges(reply_delay_min, reply_delay_max, max_context_messages, xai_timeout_seconds)
 
     return Settings(
         tg_api_id=_parse_int("TG_API_ID"),
@@ -94,8 +110,9 @@ def get_settings() -> Settings:
         tg_session_name=_get_required_str("TG_SESSION_NAME"),
         tg_target_username=_get_required_str("TG_TARGET_USERNAME"),
         xai_api_key=_get_required_str("XAI_API_KEY"),
-        xai_base_url=_get_required_str("XAI_BASE_URL"),
-        xai_model=_get_required_str("XAI_MODEL"),
+        xai_base_url=_get_optional_str("XAI_BASE_URL", DEFAULT_XAI_BASE_URL),
+        xai_model=_get_optional_str("XAI_MODEL", "grok-3-mini"),
+        xai_timeout_seconds=xai_timeout_seconds,
         reply_delay_min=reply_delay_min,
         reply_delay_max=reply_delay_max,
         max_context_messages=max_context_messages,
