@@ -1,3 +1,4 @@
+import json
 import logging
 
 from openai import OpenAI
@@ -17,7 +18,7 @@ class GrokClient:
             timeout=settings.xai_timeout_seconds,
         )
 
-    def generate_reply(self, messages: list[dict[str, str]]) -> str:
+    def generate_reply(self, messages: list[dict[str, str]]) -> dict[str, str]:
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -25,15 +26,31 @@ class GrokClient:
             )
         except Exception:
             logger.exception("xAI Chat Completions call failed")
-            return "Извини, сейчас не получилось ответить. Попробуй еще раз через минуту."
+            return {
+                "reply": "Извини, сейчас не получилось ответить. Попробуй еще раз через минуту.",
+                "action": "continue",
+            }
 
         if not response.choices:
             logger.error("xAI returned empty choices")
-            return "Извини, сейчас не получилось ответить."
+            return {"reply": "Извини, сейчас не получилось ответить.", "action": "continue"}
 
         content = response.choices[0].message.content
         if not content:
             logger.error("xAI returned empty message content")
-            return "Извини, я пока без ответа 😅"
+            return {"reply": "Извини, я пока без ответа 😅", "action": "continue"}
 
-        return content.strip()
+        raw = content.strip()
+
+        try:
+            data = json.loads(raw)
+            reply = str(data["reply"]).strip()
+            action = str(data.get("action", "continue")).strip().lower()
+            if action not in {"continue", "end"}:
+                action = "continue"
+            if not reply:
+                reply = "Извини, я пока без ответа 😅"
+            return {"reply": reply, "action": action}
+        except Exception:
+            logger.warning("Failed to parse xAI JSON response, using fallback")
+            return {"reply": raw, "action": "continue"}

@@ -7,12 +7,16 @@ from app.chat.session import SessionStore
 from app.config import Settings
 from app.constants import APP_LOGGER_NAME
 from app.safety.disclosure import build_disclosure_message
+from app.safety.validators import should_end_dialog
 from app.services.delay_service import random_reply_delay
 from app.services.reply_service import ReplyService
 from app.tg.filters import should_process_message
 from app.tg.sender import send_text
 
 logger = logging.getLogger(APP_LOGGER_NAME)
+
+
+END_REPLY_TEXT = "Ок, тогда давай закончим 🙂"
 
 
 def register_handlers(
@@ -42,8 +46,22 @@ def register_handlers(
                 await send_text(client, chat, build_disclosure_message(), settings)
                 session.disclosure_sent = True
 
-            reply_text = reply_service.build_reply(session, incoming_text)
+            if should_end_dialog(message):
+                await random_reply_delay(settings.reply_delay_min, settings.reply_delay_max)
+                await send_text(client, chat, END_REPLY_TEXT, settings)
+                session.end()
+                session_store.reset(chat_id)
+                return
+
+            response = reply_service.build_reply(session, incoming_text)
+            reply_text = response["reply"]
+            action = response["action"]
+
             await random_reply_delay(settings.reply_delay_min, settings.reply_delay_max)
             await send_text(client, chat, reply_text, settings)
+
+            if action == "end":
+                session.end()
+                session_store.reset(chat_id)
         except Exception:
             logger.exception("Failed to process message for chat_id=%s", chat_id)
