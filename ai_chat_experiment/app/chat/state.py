@@ -1,0 +1,2 @@
+ACTIVE = "active"
+ENDED = "ended"
