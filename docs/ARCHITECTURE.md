@@ -1,114 +1,122 @@
-# Anonka — целевая архитектура
+# Anonka — полная целевая архитектура
 
-> Статус: согласованная архитектурная спецификация для следующей версии проекта.  
+> Статус: каноническая архитектурная спецификация проекта.  
 > Репозиторий: `Frozertiru-gif/anonka`  
-> Цель документа: зафиксировать все решения по архитектуре до начала большого рефакторинга.
+> Назначение: зафиксировать согласованную архитектуру до большого рефакторинга и дать Codex/разработчику документ, по которому систему можно реализовывать по этапам без повторного придумывания решений.
 
 ---
 
-## 1. Что строим
+## 1. Цель проекта
 
-`anonka` — один постоянно работающий Python-процесс под пользовательским Telegram-аккаунтом через Telethon.
+`anonka` — постоянно работающий Python-процесс под **одним пользовательским Telegram-аккаунтом** через Telethon.
 
-Система должна:
+Система должна одновременно решать две задачи:
 
-1. Общаться через существующего Telegram-бота анонимных знакомств/анончата.
-2. В каждый момент времени обслуживать один активный анонимный диалог этого бота.
-3. Самостоятельно управлять жизненным циклом анончата: начать поиск, остановить поиск, перейти к следующему собеседнику, понять завершение/скип, обработать таймаут.
-4. Вести каждый новый анонимный разговор в отдельном контексте без данных предыдущего человека.
-5. По ходу обычной переписки узнавать имя, возраст, пол, город и другие факты о собеседнике. При старте комнаты никаких таких данных нет.
-6. Уметь предложить переход в обычный личный чат Telegram и перенести туда весь полезный контекст текущего человека.
-7. После подтвержденного перехода в ЛС немедленно освобождать анончат и искать следующего человека, не прекращая общение в уже открытых ЛС.
-8. Одновременно вести много независимых личных диалогов и один анонимный поток.
-9. Использовать одну фиксированную AI-девушку/персонажа. Multi-persona, выбор девушек и marketplace не нужны.
-10. Прямо позиционировать персонажа как AI. Проект не должен строиться на техническом притворстве реальным человеком.
-11. Генерировать в runtime только текст. Фото, видео и Telegram video notes/«кружки» готовятся заранее внешними сервисами.
-12. Хранить подготовленные медиа в приватном Telegram-канале/чате и отправлять оттуда.
-13. Понимать семантику медиа по тегам, а не выбирать случайный файл.
-14. Считать получение подходящего Telegram Gift от конкретного пользователя фактом оплаты текущего предложения.
-15. Позволять менять цену предложения во время работы, не меняя промпт и код. Уже созданное предложение сохраняет цену-снимок.
-16. Быть экономным по LLM: batching сообщений, короткий контекст, summary/facts, никаких лишних LLM-вызовов там, где задачу надежно решает код.
-17. Позволять заменить DeepSeek на локальную OpenAI-compatible модель без переделки остального приложения.
-18. Переживать перезапуск процесса без потери активных DM-контекстов, оплаченных предложений и состояния анончата.
+1. Вести один текущий разговор через существующего Telegram-бота анонимного чата.
+2. Параллельно вести любое разумное количество обычных личных переписок Telegram с людьми, которые перешли из анончата в ЛС.
+
+В проекте используется **одна фиксированная AI-девушка/персонаж**. Multi-persona, выбор девушек, паки разных персонажей, marketplace и любая подобная архитектура не нужны.
+
+Персонаж прямо позиционируется как AI. Цель проекта — автоматизация общения и эксперимент с поведением пользователей, а не техническая имитация реального человека.
+
+Фото, видео и Telegram video notes/«кружки» **не генерируются во время диалога**. Они заранее готовятся внешними сервисами и хранятся в Media Vault.
 
 ---
 
-## 2. Главный архитектурный принцип
+## 2. Главный принцип: максимум логики в коде
 
-**LLM отвечает за язык и семантику. Код отвечает за состояние системы и действия.**
+Основное архитектурное правило:
 
-LLM разрешено:
+> **LLM отвечает за язык, смысл реплики и семантическое намерение. Код отвечает за состояние системы, таймеры, Telegram-действия, выбор файлов, оплату, повторы и восстановление.**
 
-- написать текст ответа;
-- извлечь новые факты из текущего разговора в структурированном виде;
+### LLM разрешено
+
+- написать обычную реплику;
+- решить, что на конкретную реплику лучше вообще не отвечать;
+- извлечь новые факты о собеседнике из текущего разговора;
 - выразить намерение предложить переход в ЛС;
-- выразить намерение отправить/предложить медиа определенного типа и содержания;
-- при необходимости сформировать обычную реплику с учетом уже подтвержденных событий.
+- выразить `MediaIntent`: какой тип/содержание медиа требуется;
+- выразить `OfferIntent`: что пользователь просит платное медиа подходящей семантики;
+- учитывать подтвержденные кодом события: переход в ЛС, реально отправленное медиа, полученный Gift, выполненный offer.
 
-LLM не разрешено напрямую:
+### LLM НЕ разрешено
 
-- решать, существует ли активная комната;
 - считать таймеры;
-- решать, прошли ли 10 минут;
-- определять, что Telegram Gift реально получен;
-- выбирать `message_id` конкретного медиа;
-- выбирать конкретный файл из канала;
-- самостоятельно менять SQLite;
-- самостоятельно выполнять `/next`, `/stop`, `/search`, `/link`;
+- определять, существует ли сейчас анонимная комната;
+- самостоятельно выполнять поиск нового собеседника;
+- выполнять `/next`, `/stop`, `/search`, `/link`;
 - сбрасывать контекст;
+- выбирать конкретный `message_id`/файл из Media Vault;
+- определять, реально ли получен Telegram Gift;
 - считать оплату успешной;
-- самостоятельно завершать разговор только потому, что собеседник написал «ок»/«пон»;
-- управлять ретраями Telegram/LLM;
-- решать проблему FloodWait;
-- обеспечивать идемпотентность.
+- изменять цену;
+- менять SQLite;
+- управлять FloodWait/retry/backoff;
+- решать идемпотентность;
+- отправлять старый ответ после смены комнаты;
+- завершать разговор только потому, что пользователь написал `ок`, `пон`, `ага` и т.п.;
+- самостоятельно решать, что «пора искать следующего» после handoff — это следствие подтвержденного state transition и делает код.
 
-Все это — детерминированная логика приложения.
+Чем больше детерминированной работы можно надежно выполнить кодом, тем меньше она должна попадать в LLM.
 
 ---
 
-## 3. Что не нужно сейчас
+## 3. Что НЕ строим сейчас
 
-Не проектировать в MVP:
+Для первой рабочей версии не нужны:
 
-- несколько AI-девушек;
-- `persona_id`, каталоги персонажей, переключение персонажей;
-- генерацию фото/видео в runtime;
-- отдельный Telegram Business Bot без доказанной необходимости;
+- несколько AI-персонажей;
+- `persona_id` и каталог девушек;
+- runtime-генерация изображений/видео;
+- Telegram Business Bot без доказанной технической необходимости;
 - Postgres;
 - Redis;
 - Celery/RQ;
 - микросервисы;
-- Kubernetes/Docker Swarm;
+- Kubernetes;
 - vector DB;
-- embeddings/RAG для обычного диалога;
+- embeddings/RAG для обычного чата;
 - автоматическое vision-тегирование медиатеки;
-- сложный web-admin;
-- много процессов/воркеров;
-- отдельную платежную систему, invoice flow и checkout, пока GiftDetector решает задачу;
-- сложную «психологическую симуляцию» персонажа как обязательную часть MVP.
+- web-admin;
+- распределенные воркеры;
+- отдельная checkout/invoice система, пока GiftDetector решает задачу;
+- обязательная сложная числовая «психология» персонажа.
 
-Один процесс + Telethon + SQLite + LLM + приватный media channel достаточно.
+Начальная целевая система:
+
+```text
+1 Python process
++ Telethon
++ asyncio
++ SQLite/WAL
++ provider-agnostic LLM
++ private Telegram Media Vault
+```
 
 ---
 
-## 4. Текущее состояние репозитория и что в нем не подходит целевой задаче
+## 4. Что есть сейчас и почему этого недостаточно
 
-Текущий проект полезен как каркас, но архитектурно пока является одиночным автоответчиком:
+Существующий проект полезен как каркас, но сейчас фактически является одиночным автоответчиком:
 
-- `app/tg/handlers.py` обрабатывает входящее сообщение и сразу вызывает `ReplyService`.
-- `app/tg/filters.py` фильтрует сообщения по одному `TG_TARGET_USERNAME`.
-- `app/chat/session.py` хранит историю только в RAM.
-- Состояние фактически сведено к `active/ended`.
-- После перезапуска память исчезает.
-- `app/llm/grok_client.py` синхронно вызывает OpenAI-compatible API и заточен по именам под xAI/Grok.
-- LLM возвращает `action=continue/end`, то есть модель сейчас участвует в управлении жизненным циклом диалога.
-- `safety/validators.py` завершает разговор на коротких репликах вроде `ок`/`пон`; для естественного чата это необходимо убрать.
-- Фиксированная задержка после LLM-запроса добавляет лишнюю латентность.
-- Нет независимых DM-контекстов.
-- Нет state machine анончата.
-- Нет persistence, handoff, media index, gifts/offers, outbox, analytics.
+- `app/tg/handlers.py` получает входящее сообщение и сразу вызывает `ReplyService`;
+- `app/tg/filters.py` ориентируется на один `TG_TARGET_USERNAME`;
+- `app/chat/session.py` хранит историю в RAM;
+- состояние сведено примерно к `active/ended`;
+- после перезапуска контекст исчезает;
+- `GrokClient` синхронно вызывает OpenAI-compatible API и заточен именами под xAI;
+- LLM возвращает `action=end`, то есть сейчас модель участвует в управлении жизненным циклом;
+- короткие `ок`/`пон` могут автоматически завершать разговор;
+- фиксированная задержка добавляется поверх времени генерации;
+- нет независимых DM-контекстов;
+- нет полноценного anon state machine;
+- нет SQLite persistence;
+- нет handoff;
+- нет Media Vault/indexer/selector;
+- нет Offers/Gifts;
+- нет outbox/recovery/analytics.
 
-Проект **не надо переписывать с нуля**. Сохраняем Python, Telethon, asyncio, общую идею разбиения на `tg/`, `chat/`, `llm/`, `services/`, но меняем ответственность модулей.
+**Переписывать проект с нуля не надо.** Сохраняются Python, Telethon, asyncio, composition root и общее разбиение на Telegram/LLM/services. Меняется ответственность модулей.
 
 ---
 
@@ -117,77 +125,85 @@ LLM не разрешено напрямую:
 ```text
                          TELEGRAM ACCOUNT
                                │
-                         TelethonClient
+                         Telethon Client
                                │
-                    ┌──────────┴──────────┐
-                    │                     │
-              ANON BOT EVENTS           REAL DMs
-                    │                     │
-                AnonAdapter             DMAdapter
-                    │                     │
-                    └──────────┬──────────┘
-                               │
-                         EventRouter
-                               │
-              ┌────────────────┼─────────────────┐
-              │                │                 │
-        AnonController  ConversationService  GiftDetector
-              │                │                 │
-              │                ▼                 │
-              │          Debounce/Locks          │
-              │                │                 │
-              │          ContextBuilder          │
-              │                │                 │
-              │                ▼                 │
-              │            LLMService            │
-              │                │                 │
-              │      ┌─────────┴─────────┐       │
-              │      │                   │       │
-              │ DeepSeek/OpenAI      Local OpenAI│
-              │ compatible              compatible│
-              │      │                   │       │
-              │      └─────────┬─────────┘       │
-              │                │                 │
-              │         NormalizedResponse       │
-              │                │                 │
-              │         ActionCoordinator        │
-              │        ┌───────┼────────┐        │
-              │        │       │        │        │
-              │       text   media    handoff    │
-              │                │        │        │
-              │                ▼        │        │
-              │          MediaService    │        │
-              │                │        │        │
-              │         Telegram Vault   │        │
-              │                         │        │
-              └───────────────┬─────────┴────────┘
+          ┌────────────────────┼────────────────────┐
+          │                    │                    │
+      ANON BOT               REAL DMs           MEDIA VAULT
+          │                    │                    │
+     AnonAdapter            DMAdapter           MediaCatalog
+          │                    │                    │
+          └────────────┬───────┘                    │
+                       ▼                            │
+                  EventRouter                       │
+                       │                            │
+            ┌──────────┼───────────────┐            │
+            │          │               │            │
+     AnonController ConversationSvc GiftDetector    │
+            │          │               │            │
+            │      Debounce/Locks       │            │
+            │          │               │            │
+            │     ContextBuilder        │            │
+            │          │               │            │
+            │       LLMService          │            │
+            │          │               │            │
+            │    ChatDecision           │            │
+            │          │               │            │
+            │    ActionCoordinator      │            │
+            │      │      │      │      │            │
+            │     text   media  offer handoff        │
+            │             │      │                   │
+            │             ▼      ▼                   │
+            │        MediaSelector / OfferService    │
+            │             │      │                   │
+            └─────────────┴──────┴───────────────────┘
                               │
-                         SQLite/WAL
-                    state/history/facts/
-                media/offers/gifts/events/outbox
+                         SQLite / WAL
 ```
 
 ---
 
 ## 6. Telegram topology
 
-Используется **один пользовательский Telegram-аккаунт через Telethon**.
+Один user-account через Telethon взаимодействует с:
 
-Он взаимодействует сразу с тремя типами чатов:
+1. **Anonymous bot chat** — транспорт текущей анонимной комнаты.
+2. **Обычными DM** — реальные личные чаты пользователей.
+3. **Private Media Vault** — приватный канал/чат с заранее подготовленными медиа.
+4. **Saved Messages** — минимальный admin/runtime control.
 
-1. **Anonymous bot chat** — технический транспорт анонимной комнаты.
-2. **Обычные личные сообщения** — реальные DM после перехода.
-3. **Private Media Vault** — приватный канал/чат с заранее подготовленными фото/кружками.
-
-Отдельный Business Bot в текущей архитектуре не нужен. Добавлять его только если впоследствии будет обнаружено конкретное ограничение user-account/MTProto, которое нельзя надежно решить Telethon.
+Отдельный Business Bot не добавлять, пока user-account + MTProto/Telethon покрывает необходимые функции.
 
 ---
 
-## 7. Анончат: state machine
+# ЧАСТЬ A. АНОНИМНЫЙ ЧАТ
 
-### 7.1. Состояния
+## 7. Важное свойство конкретной анонки
 
-Минимальный набор:
+При нахождении собеседника **никаких исходных данных нет**:
+
+```text
+name   = unknown
+age    = unknown
+gender = unknown
+city   = unknown
+```
+
+В реальном контексте лучше вообще не передавать список `unknown` — при создании conversation просто:
+
+```text
+facts = {}
+```
+
+Имя, возраст, пол, город, работа, интересы и любые другие сведения узнаются только естественно из переписки.
+
+Нельзя проектировать архитектуру так, будто anonymous bot отдает анкету пользователя.
+
+---
+
+## 8. Anon state machine
+
+Минимальные состояния контроллера:
 
 ```text
 STOPPED
@@ -197,58 +213,107 @@ HANDOFF_PENDING
 SKIPPING
 ```
 
-`ENDED` для самого контроллера не нужен: законченный анонимный разговор становится архивной `conversation`, а контроллер продолжает жить.
+`ENDED` не нужен как глобальное состояние контроллера: законченная anonymous conversation архивируется, а контроллер продолжает работать.
 
-### 7.2. Переходы
+### Переходы
 
 ```text
 STOPPED
-  │ start
+  │ .anon start
   ▼
 SEARCHING
-  │ room_ready / first_partner_message
+  │ room_ready OR first_partner_message
   ▼
 ROOM_ACTIVE
   │
-  ├── inactivity_timeout(10m) ──► SKIPPING ──► SEARCHING
-  ├── partner_left ──────────────► SEARCHING
-  ├── partner_skipped ───────────► SEARCHING
-  ├── manual_next ───────────────► SKIPPING ──► SEARCHING
-  ├── handoff_intent ────────────► HANDOFF_PENDING
-  │                                  │
-  │                                  ├── dm_confirmed ─► SEARCHING
-  │                                  ├── partner_left ─► SEARCHING
-  │                                  └── timeout ──────► SKIPPING ─► SEARCHING
-  └── manual_stop ───────────────► STOPPED
+  ├── idle_timeout(10m) ───────► SKIPPING ─► SEARCHING
+  ├── partner_left/skipped ─────► SEARCHING
+  ├── manual_next ──────────────► SKIPPING ─► SEARCHING
+  ├── handoff_intent ───────────► HANDOFF_PENDING
+  │                                 │
+  │                                 ├── dm_confirmed ─► SEARCHING
+  │                                 ├── partner_left ─► SEARCHING
+  │                                 └── idle_timeout ─► SKIPPING ─► SEARCHING
+  └── manual_stop ──────────────► STOPPED
 ```
 
-### 7.3. Важное ограничение конкретного анончата
+---
 
-При нахождении собеседника **нет имени, пола, возраста, города или профиля**. Новый разговор начинается с пустого набора фактов.
+## 9. Как понять, что новый собеседник реально найден
+
+Пользователь уточнил: визуально при нахождении собеседника может не появляться отдельная анкета/данные, а сам диалог просто становится доступен.
+
+Поэтому `AnonAdapter` обязан поддерживать два варианта.
+
+### Вариант A — найден надежный технический сигнал
+
+Это может быть:
+
+- системное сообщение;
+- изменение текста сообщения бота;
+- изменение inline/reply keyboard;
+- `MessageEdited`;
+- callback/state update;
+- другой устойчивый MTProto/Telethon-признак.
+
+Тогда Adapter генерирует:
 
 ```text
-facts = {}
+ROOM_READY
 ```
 
-Любые сведения появляются только из переписки.
+и при необходимости AI может первой начать разговор.
 
-### 7.4. Как понять, что комната готова
+### Вариант B — надежного сигнала нет
 
-`AnonAdapter` не должен предполагать наличие метаданных.
+Тогда:
 
-Он должен поддержать два режима:
+```text
+SEARCHING
+→ первое реальное сообщение собеседника
+→ create conversation
+→ ROOM_ACTIVE
+→ DeepSeek activates
+```
 
-**Режим A — есть машинно распознаваемый сигнал готовой комнаты.**  
-Например системное сообщение, изменение кнопок, edit сообщения бота или другой устойчивый признак. Тогда создается `ROOM_READY` и при желании LLM может первой написать opener.
+До фактического появления partner message LLM не вызывается.
 
-**Режим B — надежного сигнала нет.**  
-Тогда переход `SEARCHING -> ROOM_ACTIVE` происходит по первому реальному сообщению собеседника. До этого LLM не вызывается.
+### Обязательный предварительный этап реализации
 
-Конкретная механика анон-бота должна быть инкапсулирована только в `AnonAdapter`, чтобы остальная система не зависела от текста/кнопок конкретного сервиса.
+Перед окончательным кодированием `AnonAdapter` нужно сделать короткий **protocol reconnaissance** конкретного анон-бота:
 
-### 7.5. Команды анон-боту
+- записать несколько циклов search → room → skip → search;
+- залогировать `NewMessage`, `MessageEdited`, reply markup, callback/raw update типы;
+- определить реальные команды/кнопки `search/next/stop/link`;
+- определить, начинает ли бот новый поиск автоматически после skip;
+- определить надежный признак `ROOM_READY`, если он существует.
 
-Все команды конфигурируемы:
+Вся эта специфика остается внутри `AnonAdapter`; остальное приложение работает с нормализованными событиями.
+
+---
+
+## 10. Нормализованные события AnonAdapter
+
+Пример:
+
+```text
+SEARCH_STARTED
+ROOM_READY
+PARTNER_MESSAGE
+PARTNER_LEFT
+PARTNER_SKIPPED
+SEARCH_STOPPED
+LINK_REQUEST_CONFIRMED
+UNKNOWN_SERVICE_EVENT
+```
+
+`AnonController` не должен парсить тексты конкретного бота сам.
+
+---
+
+## 11. Команды анон-боту
+
+Boot-time config:
 
 ```text
 ANON_SEARCH_COMMAND
@@ -257,7 +322,7 @@ ANON_STOP_COMMAND
 ANON_LINK_COMMAND
 ```
 
-Если конкретный бот использует кнопки, `AnonAdapter` может выполнять click по найденной кнопке вместо текстовой команды. Контроллер при этом вызывает одинаковые методы:
+Если бот использует кнопки, Adapter внутри делает click, но наружный интерфейс остается одинаковым:
 
 ```python
 await anon_adapter.search()
@@ -266,185 +331,328 @@ await anon_adapter.stop()
 await anon_adapter.request_link()
 ```
 
-### 7.6. 10-минутный таймаут
+---
 
-Это **таймер неактивности**, а не отдельное решение LLM.
+## 12. Постоянная reconciliation фактического состояния
 
-По умолчанию:
+**Фактическое состояние Telegram/анон-бота имеет приоритет над локальным предположением.**
+
+Это нужно не только после restart.
+
+Примеры:
+
+- пользователь сам вручную нажал «Следующий»;
+- бот автоматически начал новый поиск;
+- сообщение бота было отредактировано;
+- кнопки изменились;
+- команда отправилась, но результат пришел позже;
+- локально считали `ROOM_ACTIVE`, а бот уже перешел в search.
+
+`AnonAdapter` должен слушать не только обычные incoming `NewMessage`, но при необходимости `MessageEdited`/raw updates и обновлять наблюдаемое состояние.
+
+`AnonController.reconcile(observed_state)` переводит локальный state machine в подтвержденное состояние идемпотентно.
+
+Нельзя строить логику только по принципу «мы отправили `/next`, значит теперь точно SEARCHING`».
+
+---
+
+## 13. Watchdog состояния SEARCHING
+
+10-минутный room timeout не решает ситуацию, когда поиск завис.
+
+Нужна настройка:
+
+```text
+ANON_SEARCH_WATCHDOG_SECONDS
+```
+
+Стартовый ориентир: 60–120 секунд, затем откалибровать под конкретный бот.
+
+Flow:
+
+```text
+SEARCHING
+↓
+watchdog elapsed, room не подтверждена
+↓
+AnonAdapter.reconcile_state()
+↓
+если поиск действительно идет -> просто продолжать ждать / увеличить interval
+если поиск остановлен -> повторить search
+если состояние неизвестно -> bounded retry + backoff
+```
+
+Запрещено спамить `/search`/`/next` бесконечно.
+
+Нужны:
+
+```text
+max immediate retries
+exponential/backoff delay
+last_search_action_at
+```
+
+---
+
+## 14. 10-минутный idle timeout комнаты
+
+Стартовое значение:
 
 ```text
 ANON_IDLE_TIMEOUT_SECONDS = 600
 ```
 
-`last_activity_at` обновляется на значимых сообщениях собеседника и наших фактических ответах. Служебный шум Telegram не продлевает комнату.
+Это **таймер неактивности**, не «10 минут с момента знакомства».
 
-Если 10 минут ничего не происходит:
+`last_activity_at` обновляется при:
+
+- реальном partner message;
+- фактическом AI message, который успешно ушел;
+- ручном сообщении владельца в этот разговор.
+
+Служебные события Telegram не продлевают комнату.
+
+Если 10 минут значимой активности нет:
 
 ```text
-ROOM_ACTIVE/HANDOFF_PENDING
-    ↓
+ROOM_ACTIVE / HANDOFF_PENDING
+↓
+invalidate room generation
+↓
 SKIPPING
-    ↓
+↓
 AnonAdapter.next()
-    ↓
-закрыть старую conversation reason=idle_timeout
-    ↓
+↓
+conversation end_reason=idle_timeout
+↓
 SEARCHING
 ```
 
-LLM при этом не вызывается.
-
-### 7.7. Что происходит после подтвержденного перехода в ЛС
-
-После `dm_confirmed` код сам:
-
-1. Привязывает текущий логический conversation к реальному `telegram_peer_id`.
-2. Переводит транспорт разговора в `dm`.
-3. Сохраняет историю, facts, summary и активное предложение.
-4. Закрывает anonymous room transport.
-5. Сбрасывает состояние анон-контроллера.
-6. Немедленно запускает поиск следующего человека.
-
-**DeepSeek не должен выдавать отдельную команду «ищи следующего». Это следствие подтвержденного state transition и выполняется кодом автоматически.**
+LLM не вызывается.
 
 ---
 
-## 8. Защита от старых ответов LLM
+## 15. Защита от старого ответа после смены собеседника
 
-Критический сценарий:
+Критический race:
 
 ```text
-человек A пишет
-↓
-LLM начала генерацию
-↓
-A скипнул
-↓
-нашелся B
-↓
-старый ответ A готов
+A пишет
+→ LLM начала думать
+→ A ушел
+→ появился B
+→ старый ответ A готов
 ```
 
 Он не должен уйти B.
 
-Для анончата используется монотонный `room_generation`:
+Каждая anonymous room получает монотонный:
 
 ```text
-room A generation=41
-room B generation=42
+room_generation
 ```
 
-Каждый LLM job получает snapshot generation.
+Пример:
 
-Перед отправкой:
+```text
+A generation=41
+B generation=42
+```
+
+Каждый LLM job сохраняет snapshot generation.
+
+Перед любой отправкой в anon transport:
 
 ```python
 if job.room_generation != anon_controller.current_generation:
-    discard_response()
+    drop_response()
 ```
 
-Также при `partner_left`, `manual_next`, `handoff_confirmed`, `stop` ожидающая async task отменяется, если это безопасно.
+При `partner_left`, `manual_next`, `stop`, `handoff_confirmed` generation инвалидируется **до** перехода к следующей комнате.
+
+Если async generation можно безопасно отменить — task отменяется; generation guard все равно остается обязательным как последняя защита.
 
 ---
 
-## 9. Conversation model
+# ЧАСТЬ B. CONVERSATIONS И ЛС
 
-### 9.1. Логический conversation
+## 16. Conversation = один человек, а не один транспорт
 
-Conversation — это **один конкретный человек и один непрерывный контекст**, независимо от того, начался он в анонке или продолжился в ЛС.
+Один человек должен иметь **один непрерывный logical conversation**, даже если разговор начался в анонке, а продолжился в DM.
 
-Лучше не создавать новый LLM-контекст при handoff. Сохраняется тот же `conversation_id`, меняется транспорт:
+До handoff:
 
 ```text
 conversation #184
 channel = anon
-peer_id = NULL
-        ↓ handoff
-conversation #184
-channel = dm
-peer_id = 123456789
+telegram_peer_id = NULL
 ```
 
-Следующий анонимный человек получает новый `conversation #185`.
+После подтвержденного handoff:
 
-Так не нужен искусственный «копипаст контекста» между двумя сущностями.
+```text
+conversation #184
+channel = dm
+telegram_peer_id = 123456789
+```
 
-### 9.2. Сообщения обязаны хранить transport snapshot
+История, facts, summary, sent media и active offer сохраняются.
 
-Каждая запись сообщения содержит:
+Следующий новый анонимный человек получает новый `conversation_id`.
+
+---
+
+## 17. Transport snapshot у каждого сообщения
+
+У сообщения обязательно хранится:
 
 ```text
 transport = anon | dm
 ```
 
-Поэтому история все равно показывает, где именно была отправлена каждая реплика.
+Поэтому после handoff можно восстановить, какие реплики были в anonymous bot и какие уже в личке.
 
-### 9.3. Параллельность
+---
+
+## 18. Параллельные разговоры
 
 Одновременно допустимо:
 
 ```text
-anon conversation #201 active
+anon #205 active
 DM #184 active
 DM #173 active
-DM #146 active
+DM #151 active
 ...
 ```
 
-У каждой conversation свои:
+Каждая conversation имеет отдельные:
 
 - history;
 - facts;
 - summary;
-- debounce;
+- debounce buffer;
 - async lock;
+- pending generation version;
 - active offer;
-- sent media set;
+- sent media history;
 - last activity;
-- pending LLM job/version.
+- manual override state.
+
+Контексты не смешиваются.
 
 ---
 
-## 10. Handoff anon -> DM
+## 19. Handoff anon → DM
 
-Это одна из немногих частей, где есть ограничение Telegram: обычный новый DM сам по себе не обязан сообщать, из какой анонимной комнаты пришел человек.
+AI может семантически предложить переход:
 
-### 10.1. Предпочтительный механизм
-
-Если текущий anonymous bot через `/link` умеет дать человеку прямую ссылку на профиль, используем именно эту механику.
-
-При намерении перейти в ЛС:
-
-```text
-LLM: handoff_intent=offer
-↓
-код: AnonAdapter.request_link()
-↓
-state=HANDOFF_PENDING
-↓
-создать handoff record с deadline
+```json
+{"handoff_intent":"offer"}
 ```
 
-### 10.2. Сопоставление DM
+Но сама модель не вызывает Telegram-команды.
 
-Порядок надежности:
+Код:
 
-1. **Уникальный token/prefilled text**, если конкретная ссылка/бот позволяет его передать.
-2. Если token передать невозможно — temporal correlation, потому что в анонке одновременно только один `HANDOFF_PENDING`.
-3. Кандидатом считается новый DM peer, у которого еще нет существующего conversation и который появился в handoff window.
-4. Если одновременно появились несколько неизвестных новых DM и нельзя однозначно выбрать — не гадать. Состояние помечается `ambiguous`, требуется ручное подтверждение/не выполняется автоматическая миграция.
+```text
+handoff_intent
+→ AnonAdapter.request_link()   # например /link
+→ state = HANDOFF_PENDING
+→ создать handoff record
+→ продолжать обрабатывать сообщения этой комнаты
+```
 
-Существующие старые DM не должны случайно поглотить pending handoff.
+### Подтверждение перехода
 
-### 10.3. Handoff timeout
+Обычный новый DM сам по себе может не содержать ссылку на anonymous room.
 
-Если человек не написал в ЛС и 10-минутный inactivity timeout истек, текущая анонимная комната скипается, handoff закрывается как `expired`, начинается новый поиск.
+Порядок сопоставления:
+
+1. **Уникальный token/prefilled text**, если конкретный link flow технически позволяет его передать.
+2. Если bot просто отдает прямую ссылку на профиль — **temporal correlation**, потому что одновременно существует максимум один active `HANDOFF_PENDING`.
+3. Кандидат: новый неизвестный DM peer, появившийся в handoff window и не имеющий существующей активной conversation.
+4. Если одновременно возникли несколько неизвестных новых DM и соответствие неоднозначно — не угадывать. `handoff.state=ambiguous`, требуется ручное подтверждение.
+
+Старый существующий DM нельзя случайно привязать к pending handoff.
+
+### После `dm_confirmed`
+
+Код автоматически:
+
+1. привязывает `telegram_peer_id` к текущей conversation;
+2. меняет `channel=dm`;
+3. сохраняет тот же context/facts/summary/offers/media history;
+4. инвалидирует old anon generation;
+5. освобождает anon transport;
+6. переводит AnonController в поиск следующего человека;
+7. DM продолжает жить независимо.
+
+**LLM не отдает отдельную команду «ищи нового».** Это обязательное code-side следствие подтвержденного handoff.
 
 ---
 
-## 11. Debounce входящих сообщений
+## 20. Handoff timeout
 
-Люди в Telegram часто пишут пачкой:
+Если переход предложен, но человек не написал в ЛС, idle timeout продолжает действовать.
+
+При истечении:
+
+```text
+handoff=expired
+conversation end_reason=idle_timeout/handoff_expired
+AnonAdapter.next()
+SEARCHING
+```
+
+Если пользователь продолжает писать в анонке во время `HANDOFF_PENDING`, сообщения обрабатываются нормально и `last_activity_at` обновляется.
+
+---
+
+## 21. Ручные сообщения владельца и MANUAL_OVERRIDE
+
+Поскольку используется **user-account**, владелец может сам открыть Telegram и что-то написать вручную.
+
+Это обязательно учитывать.
+
+### Все исходящие сообщения аккаунта — события
+
+EventRouter должен обрабатывать не только incoming, но и релевантные outgoing messages.
+
+Если сообщение отправлено вручную, а не нашим outbox:
+
+1. найти соответствующую conversation;
+2. записать сообщение в SQLite как `role=assistant`, `source=manual`;
+3. обновить `last_activity_at`;
+4. отменить/сделать stale конфликтующий pending AI response;
+5. включить для этой conversation временный `MANUAL_OVERRIDE`.
+
+### MANUAL_OVERRIDE
+
+Это **не отдельный глобальный режим приложения**, а per-conversation cooldown.
+
+Стартовый параметр:
+
+```text
+MANUAL_OVERRIDE_SECONDS = 60
+```
+
+Пока override активен:
+
+- incoming сообщения сохраняются;
+- AI не должна внезапно отправить параллельный ответ;
+- после таймаута автоматика возобновляется;
+- admin-командой можно resume раньше.
+
+Если владелец вручную нажал кнопки/команды анончата, observed-state reconciliation синхронизирует AnonController.
+
+---
+
+# ЧАСТЬ C. ОБРАБОТКА СООБЩЕНИЙ И LLM
+
+## 22. Debounce пачек сообщений
+
+Telegram-пользователь часто пишет:
 
 ```text
 слушай
@@ -454,67 +662,79 @@ state=HANDOFF_PENDING
 ахах
 ```
 
-Нельзя делать пять LLM-вызовов.
+Нельзя делать пять LLM calls.
 
-Для каждой conversation существует `MessageDebouncer`:
-
-```text
-incoming msg
-↓
-append to pending batch
-↓
-wait 1.5-2.5 sec after LAST message
-↓
-combine batch
-↓
-one LLM call
-```
-
-Настройка:
+Для каждой conversation:
 
 ```text
-MESSAGE_DEBOUNCE_MS = 1800   # стартовое значение
+incoming
+→ append pending batch
+→ wait after LAST message
+→ combine
+→ one LLM call
 ```
 
-Новый message во время debounce перезапускает timer.
+Старт:
 
-Если сообщение приходит, когда generation уже идет, возможны два режима:
+```text
+MESSAGE_DEBOUNCE_MS = 1800
+```
 
-- для MVP: дождаться текущей generation, затем обработать накопленный следующий batch;
-- SHOULD: помечать текущий job stale и отменять до отправки, если новый текст делает ответ явно устаревшим.
+Новый message перезапускает debounce timer.
 
-Per-conversation обработка строго последовательна. Разные DM conversations могут выполняться параллельно.
+Per-conversation обработка строго последовательна; разные conversations могут обрабатываться параллельно.
 
 ---
 
-## 12. Concurrency model
+## 23. `no_reply`
+
+Иногда естественная реакция — ничего не отправлять.
+
+Поэтому ответ LLM не должен требовать обязательный `text`.
+
+```python
+class ChatDecision(BaseModel):
+    response_mode: Literal["reply", "no_reply"] = "reply"
+    text: str | None = None
+    ...
+```
+
+Правила:
+
+- `no_reply` не означает завершение conversation;
+- входящее сообщение все равно сохраняется;
+- learned facts все равно могут примениться;
+- таймер activity остается корректным;
+- `no_reply` нельзя использовать вместо обработки service events — service events вообще не должны идти в обычный LLM pipeline;
+- код не должен жестко игнорировать все `ага/ахах`: контекст может требовать ответа, поэтому для обычного текста это семантическое решение модели.
+
+---
+
+## 24. Concurrency model
 
 Используем `asyncio`.
 
-### MUST
+MUST:
 
-- один `asyncio.Lock` на conversation;
-- отдельный lock/state machine у `AnonController`;
-- `AsyncOpenAI`/асинхронный HTTP вместо синхронного `OpenAI`, чтобы не блокировать Telethon event loop;
-- глобальный `asyncio.Semaphore` для ограничения одновременных LLM запросов;
-- все долгие timer/debounce jobs — async tasks;
-- на shutdown tasks корректно отменяются.
+- `asyncio.Lock` на conversation;
+- отдельный lock у AnonController;
+- `AsyncOpenAI`/асинхронный HTTP;
+- global `asyncio.Semaphore` для LLM;
+- async debounce/timers;
+- graceful cancellation на shutdown;
+- stale-generation/version guard перед отправкой.
 
-Стартовая настройка:
+Старт:
 
 ```text
 LLM_MAX_CONCURRENCY = 4
 ```
 
-Меняется по реальной нагрузке.
-
 ---
 
-## 13. LLM provider abstraction
+## 25. Provider-agnostic LLM layer
 
-Ни ConversationService, ни Telegram код не должны знать слово DeepSeek.
-
-Интерфейс:
+Ни Telegram, ни conversation, ни media code не должны знать, что backend — DeepSeek.
 
 ```python
 class LLMProvider(Protocol):
@@ -526,56 +746,63 @@ class LLMProvider(Protocol):
         ...
 ```
 
-Реализации:
+Первая реализация:
 
 ```text
 OpenAICompatibleProvider
 ```
 
-На первом этапе одной реализации достаточно, потому что и DeepSeek, и большинство локальных серверов поддерживают OpenAI-compatible API.
+Она покрывает DeepSeek и большинство локальных OpenAI-compatible серверов.
 
-Конфиг:
+### DeepSeek
 
 ```dotenv
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=...
 LLM_MODEL=deepseek-v4-flash
-LLM_TIMEOUT_SECONDS=45
-LLM_MAX_OUTPUT_TOKENS=500
 LLM_THINKING=disabled
 ```
 
-Переключение на локальную модель:
+### Локальная модель
 
 ```dotenv
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=http://127.0.0.1:1234/v1
 LLM_API_KEY=local
-LLM_MODEL=<local-model-name>
+LLM_MODEL=<model-name>
 ```
 
-Telegram, SQLite, MediaService, GiftDetector, handoff и state machine не меняются.
+Остальной проект не меняется.
 
-### DeepSeek default
-
-Для обычного чата стартовый профиль:
+Optional later:
 
 ```text
-DeepSeek V4 Flash
-thinking/reasoning = OFF
-короткий max output
+primary=local
+fallback=deepseek
 ```
 
-Thinking не нужен для бытовых сообщений. Отдельный escalation path можно добавить позже, если измерения покажут пользу.
+Но fallback должен быть отключаемым.
 
 ---
 
-## 14. Нормализованный ответ LLM
+## 26. DeepSeek default policy
 
-Модель не должна возвращать `end` и напрямую управлять приложением.
+Для обычного Telegram-чата:
 
-Пример целевой Pydantic-схемы:
+```text
+DeepSeek V4 Flash
+thinking/reasoning OFF
+короткий max output
+```
+
+Reasoning не нужен по умолчанию для бытовых сообщений и только увеличивает latency/стоимость.
+
+Отдельный escalation path для сложных запросов — LATER, только если метрики реально покажут пользу.
+
+---
+
+## 27. Нормализованный ChatDecision
 
 ```python
 class FactUpdate(BaseModel):
@@ -584,7 +811,7 @@ class FactUpdate(BaseModel):
     confidence: float = 1.0
 
 class MediaIntent(BaseModel):
-    media_type: Literal["photo", "video_note", "any"] = "any"
+    media_type: Literal["photo", "video_note", "video", "any"] = "any"
     access: Literal["casual", "teaser", "paid", "any"] = "any"
     content: list[str] = []
     view: list[str] = []
@@ -592,90 +819,96 @@ class MediaIntent(BaseModel):
     scene: list[str] = []
 
 class ChatDecision(BaseModel):
-    text: str
+    response_mode: Literal["reply", "no_reply"] = "reply"
+    text: str | None = None
     learned_facts: list[FactUpdate] = []
     media_intent: MediaIntent | None = None
     offer_intent: MediaIntent | None = None
     handoff_intent: Literal["none", "offer"] = "none"
 ```
 
-Нет полей:
+Никогда не добавлять в эту схему:
 
 ```text
 next_room
 stop_room
+search_room
 payment_success
 selected_media_id
 end_conversation
 ```
 
-Это зона кода.
+---
 
-### Ошибка structured output
+## 28. Structured-output validation
 
-1. Валидируем через Pydantic.
-2. Максимум один cheap repair/retry, если response вообще нельзя использовать.
-3. Если текст можно безопасно извлечь, отправляем только текст и игнорируем действия.
-4. Никогда не выполнять непровалидированное действие из сырого текста.
+1. Pydantic validation.
+2. Максимум один дешевый repair/retry при полностью сломанной структуре.
+3. Если удалось безопасно извлечь только обычный текст — разрешено отправить текст, но **игнорировать все непровалидированные действия**.
+4. Никогда не выполнять Telegram/media/payment action из невалидного сырого JSON.
 
 ---
 
-## 15. Персонаж и поведение
+# ЧАСТЬ D. ПЕРСОНА, КОНТЕКСТ И ПАМЯТЬ
 
-У нас **одна девушка**. Не нужен generic `personas` framework.
+## 29. Одна фиксированная персона
 
-Хранить статическую настройку отдельно от кода, например:
+Не создавать generic persona framework.
+
+Хранение:
 
 ```text
-app/prompts/persona.md
-app/prompts/examples.json
+app/llm/prompts/system.md
+app/llm/prompts/persona.md
+app/llm/prompts/examples.json
 ```
 
-### Слои контекста
+Persona задает:
+
+- что это AI-девушка;
+- имя/возраст/базовую биографию самой AI-персоны после окончательного выбора;
+- стиль речи;
+- среднюю длину сообщений;
+- сленг/мат/эмодзи;
+- инициативность;
+- характер;
+- отсутствие assistant-style фраз;
+- отсутствие списков/канцелярита в обычном разговоре;
+- несколько качественных few-shot примеров;
+- не повторять «я AI» в каждом сообщении, но и не отрицать AI-природу.
+
+---
+
+## 30. Слои LLM-контекста
+
+Порядок:
 
 ```text
 1. SYSTEM CORE
-2. CHARACTER / BEHAVIOR
+2. PERSONA / BEHAVIOR
 3. FEW-SHOT STYLE EXAMPLES
-4. CURRENT RUNTIME FACTS (price, channel, active offer)
-5. KNOWN FACTS ABOUT THIS USER
+4. CURRENT RUNTIME CONTEXT
+5. KNOWN FACTS ABOUT USER
 6. ROLLING SUMMARY
 7. RECENT MESSAGES
 8. CURRENT MESSAGE BATCH
 ```
 
-Первые 1-3 — максимально стабильный prefix.
-
-### Persona должна задавать
-
-- что это AI-девушка;
-- базовое имя/возраст/биографию персонажа, когда они будут окончательно выбраны;
-- стиль речи;
-- типичную длину сообщения;
-- отношение к сленгу/мату/эмодзи;
-- инициативность;
-- few-shot примеры реальных желаемых ответов;
-- запрет на assistant-style фразы типа «чем еще помочь?»;
-- запрет на списки/формальный стиль в обычном чате;
-- правило не повторять disclosure в каждом сообщении, но не отрицать свою AI-природу.
-
-### Dynamic mood/relationship state
-
-Можно добавить позже (`interest`, `trust`, `irritation` и т.п.), но это **SHOULD/LATER**, а не обязательная часть MVP. Сначала измерить качество простой persona + facts + history.
+Стабильные пункты 1–3 идут в начале, чтобы максимизировать provider-side prefix/context caching там, где backend это поддерживает.
 
 ---
 
-## 16. Факты о собеседнике
+## 31. Факты о собеседнике
 
-При старте anonymous conversation:
+Новая anonymous conversation:
 
 ```text
 facts = {}
 ```
 
-Нет скрытой анкеты и нет обязательного опроса.
+Нет обязательной анкеты.
 
-Если в разговоре естественно выясняется:
+Если в обычной переписке выясняется:
 
 ```text
 имя
@@ -684,124 +917,137 @@ facts = {}
 город
 работа
 интересы
-важные события
+события
 предпочтения
 ```
 
-LLM в **том же основном запросе**, в котором пишет ответ, может вернуть `learned_facts`.
+они извлекаются **в том же LLM call**, который генерирует ответ.
 
-Не делать второй отдельный extraction call на каждую реплику.
+Не делать отдельный extraction request на каждую реплику.
 
-### Пример
+Факт хранит:
 
 ```text
-USER: мне 24 вообще
+key
+value
+confidence
+source_message_id
+updated_at
 ```
 
-```json
-{
-  "text": "а, тогда плюс-минус ровесники)",
-  "learned_facts": [
-    {"key":"age","value":24,"confidence":1.0}
-  ]
-}
-```
-
-Facts сохраняются локально.
-
-Неизвестные поля не передавать в LLM как длинный список `unknown`; просто отсутствуют.
+Неизвестные поля не передаются модели вообще.
 
 ---
 
-## 17. Контекст и память
+## 32. Anonymous context budget
 
-### 17.1. Anonymous conversation
+Для короткоживущей анонки:
 
-Анончат короткоживущий, поэтому экономим:
+- recent: ориентир 20–30 сообщений;
+- facts: только реально узнанные;
+- summary обычно не нужен до threshold;
+- законченная conversation без handoff больше не участвует в LLM.
 
-- recent: ориентир 20-30 сообщений;
-- facts: только реально узнанное;
-- summary обычно не нужен до достижения threshold;
-- после окончания без handoff разговор можно архивировать и больше не использовать в LLM.
+---
 
-### 17.2. DM conversation
+## 33. DM context budget
 
-Для долгого общения:
+Для долгого DM:
 
-- recent: ориентир 30-50 сообщений;
+- recent: ориентир 30–50 сообщений;
 - durable facts;
 - rolling summary;
 - optional relationship state позже.
 
-Не отправлять всю историю целиком.
-
-### 17.3. Summary policy
-
-Summary обновляется **по коду при достижении порога**, а не каждый turn.
-
-Например:
-
-```text
-если unsummarized_messages >= 40
-или estimated_context_size > soft_limit
-→ summarize older slice once
-```
-
-Суммаризация может использовать тот же дешевый provider. Это отдельный редкий LLM call, а не постоянный налог.
+Не отправлять всю историю с начала знакомства.
 
 ---
 
-## 18. Human-like delivery без тупой задержки
+## 34. Summary policy
 
-Текущая схема `LLM latency + random 3-10s` дает лишнюю задержку.
-
-Нужно считать **целевое общее время ответа**.
-
-Пример:
+Суммаризация запускается кодом только по threshold, например:
 
 ```text
-короткий ответ: target 0.8-1.8s
-обычный:        target 1.5-3.0s
-длинный:        target 2.5-5.0s
+unsummarized_messages >= 40
+OR estimated_context_size > soft_limit
 ```
 
-Если LLM уже думала 2.2 секунды при target=2.5:
+Тогда старый slice сворачивается один раз.
 
-```text
-additional_delay = 0.3s
-```
-
-Формула:
-
-```text
-sleep = max(0, target_total_delay - generation_elapsed)
-```
-
-Во время ожидания/генерации можно использовать Telegram typing action.
-
-Не использовать LLM для расчета задержки.
+Summary — редкий дополнительный LLM-call, а не операция после каждой реплики.
 
 ---
 
-## 19. Media Vault
+## 35. Dynamic relationship state
 
-### 19.1. Источник
+Параметры вроде:
 
-Один приватный Telegram channel/chat является canonical Media Vault.
+```text
+interest
+trust
+irritation
+flirt
+```
 
-Runtime-генерации нет.
+можно добавить позже, но это **SHOULD/LATER**, не MUST.
+
+Сначала проверить качество простой схемы:
+
+```text
+persona + few-shot + facts + summary + recent history
+```
+
+---
+
+## 36. Human-like delivery
+
+Не использовать старую схему:
+
+```text
+LLM latency + random 3..10 sec
+```
+
+Нужно задавать target total response time.
+
+Стартовые ориентиры:
+
+```text
+short:   0.8–1.8s
+normal:  1.5–3.0s
+long:    2.5–5.0s
+```
+
+```text
+additional_sleep = max(0, target_total - generation_elapsed)
+```
+
+Во время generation/delay использовать typing action, если это корректно для конкретного transport.
+
+---
+
+# ЧАСТЬ E. MEDIA VAULT
+
+## 37. Media Vault
+
+Canonical media storage — один приватный Telegram channel/chat.
+
+Runtime generation отсутствует.
 
 Преимущества:
 
-- медиа заранее загружено в Telegram;
-- можно пополнять с телефона;
-- локальный диск не обязан хранить все видео;
-- приложение хранит только индекс и source message ID;
-- при отправке можно заново получить source message и использовать свежее media reference.
+- большие видео уже находятся в Telegram;
+- можно пополнять библиотеку с телефона;
+- локальный диск не обязан хранить все файлы;
+- приложение хранит индекс;
+- перед отправкой source message можно получить заново и тем самым обновить media/file reference.
 
-### 19.2. Не хранить вечный serialized media object
+---
 
-В SQLite хранятся:
+## 38. Что хранить в SQLite
+
+Не сериализовать Telegram media object «навечно».
+
+Хранить:
 
 ```text
 source_chat_id
@@ -812,27 +1058,27 @@ source_message_id
 
 ```text
 fetch source message
-↓
-получить актуальный media object
-↓
-send/copy media в target DM
+→ получить актуальный media object
+→ send/copy в target chat
 ```
 
-Это устойчивее к истечению file references.
-
-### 19.3. Video notes
-
-Кружки сохраняются в vault именно как video note, если это возможно. `MediaSender` должен сохранять требуемый тип при повторной отправке.
+Если file reference устарел — refetch source и один ограниченный retry.
 
 ---
 
-## 20. Семантическая разметка медиа
+## 39. Кружки
 
-LLM не должна видеть 500 `message_id` и описания всех файлов.
+Video notes сохраняются в Vault как video note, если возможно.
 
-В private channel каждое медиа имеет caption с машинно-читаемыми тегами.
+`MediaSender` обязан сохранять тип `video_note`, а не превращать кружок в обычное видео.
 
-Рекомендуемый формат — key/value, потому что он менее двусмысленный, чем свободные хэштеги:
+---
+
+## 40. Разметка медиа
+
+Каждое media message в Vault имеет machine-readable caption.
+
+Рекомендуемый формат:
 
 ```text
 #anonka_media
@@ -845,7 +1091,7 @@ scene=bedroom
 series=bedroom_01
 ```
 
-Для кружка:
+Кружок:
 
 ```text
 #anonka_media
@@ -858,28 +1104,31 @@ scene=home
 series=home_02
 ```
 
-### MUST поля
+### MUST
 
 ```text
-type      = photo | video_note | video
-access    = casual | teaser | paid
-content   = один или несколько тегов
+type    = photo | video_note | video
+access  = casual | teaser | paid
+content = one or more semantic tags
 ```
 
-### Optional поля
+### Optional
 
 ```text
 view
 outfit
 scene
 series
+description
 ```
 
-Не делать десятки обязательных полей.
+`description` — короткая ручная поясняющая строка для редких случаев, где одних тегов мало. Она хранится в каталоге, но **весь каталог описаний никогда не отправляется LLM**.
 
-### Минимальная taxonomy
+---
 
-Стартовый словарь может содержать, например:
+## 41. Минимальная taxonomy
+
+Начальный словарь:
 
 ```text
 content:
@@ -912,31 +1161,28 @@ scene:
   outside
 ```
 
-Словарь расширяется конфигом без миграции БД.
+Словарь расширяется конфигом/кодом без миграции схемы БД.
+
+Не создавать 30 обязательных колонок.
 
 ---
 
-## 21. Media indexing
+## 42. MediaIndexer
 
-`MediaIndexer`:
-
-1. Читает сообщения vault channel.
-2. Находит marker `#anonka_media`.
-3. Парсит metadata.
-4. Валидирует обязательные поля и allowed tags.
-5. Upsert в `media_assets` по `(source_chat_id, source_message_id)`.
-6. Не удаляет asset автоматически при временной ошибке Telegram.
-7. При ручном reindex обновляет metadata.
-
-Невалидный caption не падает всем приложением — asset помечается/логируется как invalid и не участвует в выборе.
+1. Читает Vault.
+2. Ищет `#anonka_media`.
+3. Парсит caption.
+4. Валидирует MUST поля/tags.
+5. Upsert `(source_chat_id, source_message_id)`.
+6. Невалидный asset логируется и не участвует в выборе.
+7. `.media reindex` перечитывает metadata.
+8. Временная Telegram-ошибка не должна автоматически удалять asset из DB.
 
 ---
 
-## 22. MediaIntent и MediaSelector
+## 43. LLM не выбирает файл
 
-LLM возвращает **намерение**, не файл.
-
-Пример:
+LLM возвращает только семантику:
 
 ```json
 {
@@ -949,60 +1195,118 @@ LLM возвращает **намерение**, не файл.
 }
 ```
 
-Далее работает локальный `MediaSelector`.
-
-### Фильтры
-
-MUST:
-
-- `enabled=true`;
-- правильный `access`;
-- подходящий `media_type`;
-- asset не был отправлен этой conversation;
-- обязательные content tags совпадают.
-
-### Скоринг
-
-Пример:
-
-```text
-exact content tag      +10
-exact view             +5
-exact outfit           +5
-requested media type   +3
-same active series     +2
-already sent           EXCLUDE
-very high global usage -1
-```
-
-Выбрать случайный элемент из top-N равных кандидатов, чтобы не повторять один и тот же файл всем.
-
-### Fallback
-
-Fallback должен быть явным и ограниченным.
-
-Например:
-
-```text
-requested video_note + breasts
-↓ none
-photo + breasts
-↓ found
-```
-
-Но нельзя автоматически превращать `breasts` в `butt` только потому, что что-то есть в каталоге.
-
-Если релевантного asset нет — `MEDIA_NOT_AVAILABLE`. Код не должен отправлять случайное нерелевантное медиа.
-
-### Series
-
-`series` nullable. Это полезная, но не обязательная функция для визуальной непрерывности одного места/одежды. MVP может сначала не учитывать series, но поле лучше сразу заложить.
+Она **не видит** `message_id`, filenames и полный каталог.
 
 ---
 
-## 23. Бесплатные и платные медиа
+## 44. MediaSelector
 
-`access`:
+MUST фильтры:
+
+- `enabled=true`;
+- подходящий `access`;
+- подходящий `media_type`;
+- обязательные `content` tags совпадают;
+- asset еще не отправлялся этой conversation.
+
+Пример scoring:
+
+```text
+exact content      +10
+exact view          +5
+exact outfit        +5
+exact media type    +3
+same series         +2
+already sent       EXCLUDE
+high global usage   -1
+```
+
+Выбирать случайно из top-N сопоставимых кандидатов, чтобы не отправлять всем всегда один и тот же asset.
+
+---
+
+## 45. Fallback media matching
+
+Fallback только явный и ограниченный.
+
+Допустимо:
+
+```text
+video_note + breasts
+→ none
+photo + breasts
+→ found
+```
+
+Недопустимо:
+
+```text
+request=breasts
+→ отправить butt-only asset просто потому, что он есть
+```
+
+Если релевантного asset нет:
+
+```text
+MEDIA_NOT_AVAILABLE
+```
+
+Код ничего случайного не отправляет.
+
+---
+
+## 46. Series continuity
+
+`series` nullable.
+
+Если используется, selector может предпочитать текущую серию/локацию/одежду для визуальной непрерывности.
+
+Это SHOULD, а не обязательный MVP-блок.
+
+---
+
+## 47. Что реально было отправлено — вернуть в контекст
+
+Критически важно различать:
+
+```text
+LLM хотела отправить X
+```
+
+и
+
+```text
+код реально отправил конкретный asset Y
+```
+
+После успешной отправки MediaSender записывает `conversation_media` и внутреннее domain event, например:
+
+```json
+{
+  "event":"media_sent",
+  "media_type":"photo",
+  "access":"paid",
+  "content":["breasts"],
+  "view":["front"],
+  "outfit":["lingerie"],
+  "scene":["bedroom"],
+  "series":"bedroom_01"
+}
+```
+
+На **следующем** обычном LLM-call ContextBuilder добавляет компактный факт о реально отправленном медиа.
+
+Это позволяет модели корректно понимать:
+
+> «а есть такая же сзади?»
+
+без отправки полного Media Vault в контекст.
+
+---
+
+# ЧАСТЬ F. OFFERS И TELEGRAM GIFTS
+
+## 48. Access classes
 
 ```text
 casual
@@ -1010,134 +1314,172 @@ teaser
 paid
 ```
 
-### Casual/teaser
+`casual/teaser` могут быть отправлены сразу согласно local policy.
 
-Может отправляться сразу после валидного `media_intent` согласно локальной политике.
-
-### Paid
-
-Не отправляется до подтвержденного Gift.
-
-LLM может создать `offer_intent`, но **price и конкретный asset контролирует код**.
+`paid` — только после подтвержденного Gift.
 
 ---
 
-## 24. Offer flow
+## 49. Offer flow
 
-Лучше резервировать конкретный media asset **до** оплаты, чтобы после Gift пользователь получил именно то, о чем шла речь.
-
-Flow:
+Для платного запроса лучше **зарезервировать конкретный asset до оплаты**.
 
 ```text
-user asks/request context
-↓
-LLM returns offer_intent MediaIntent
-↓
-MediaSelector finds compatible unsent asset
-↓
-if none -> no offer is created
-↓
-read current runtime price
-↓
-create Offer(price_snapshot, selected_asset_id)
-↓
-LLM text/next text references current offer price
-↓
-wait Gift
+user context/request
+→ LLM OfferIntent
+→ MediaSelector finds compatible unsent asset
+→ if none: offer not created
+→ read current runtime minimum Gift price
+→ create Offer(price_snapshot, selected_asset_id, intent_snapshot)
+→ wait Gift
 ```
 
-У active offer всегда фиксировано:
+Offer хранит:
 
 ```text
 required_stars_snapshot
 selected_asset_id
 media_intent_snapshot
+status
 ```
 
-Если runtime price изменился через минуту, старый offer не меняется.
+Изменение `.price` не меняет существующий offer.
 
 ---
 
-## 25. Telegram Gift = payment event
+## 50. Цена через Gifts
 
-Для текущего эксперимента **получение подходящего Gift от пользователя считается оплатой**.
-
-Не нужен отдельный checkout.
-
-`GiftDetector` должен работать только по Telegram/MTProto event данным.
-
-Он извлекает насколько доступно в конкретной версии Telethon/MTProto:
+Runtime config:
 
 ```text
-telegram_message_id / unique event key
+offer_price_stars = 30 / 50 / ...
+```
+
+Фактически Telegram Gifts имеют доступные платформой номиналы, поэтому базовая policy:
+
+```text
+single received Gift with known star value >= required_stars_snapshot
+→ payment satisfied
+```
+
+Перед production-like запуском GiftAdapter должен подтвердить, какие поля и номиналы реально приходят на установленной версии Telethon/MTProto.
+
+Если exact 30/50 Gift недоступен, UI/персонаж должен ориентироваться на существующий подходящий Gift, а snapshot policy остается `>= threshold`.
+
+---
+
+## 51. GiftDetector
+
+GiftDetector работает только по Telegram event данным.
+
+Нужно получить, насколько позволяет установленная версия Telethon/MTProto:
+
+```text
+telegram_chat_id
+telegram_message_id / stable event key
 sender_peer_id
 gift identifier
-gift stars/value
+gift star value
 received_at
 ```
 
-До реализации нужно отдельно подтвердить точную структуру raw service message на установленной версии Telethon и написать fixture test. Это adapter detail, а не ответственность LLM.
+До реализации обязательно:
 
-### Matching
+- поймать реальный Gift service message;
+- сохранить raw fixture;
+- проверить exact Telethon type/fields;
+- написать integration test.
 
-Gift может закрыть только offer той conversation, чей `telegram_peer_id == gift.sender_peer_id`.
+Если `gift_stars` нельзя надежно определить — **не считать payment автоматически** до появления корректного adapter mapping.
 
-MVP policy:
+---
+
+## 52. Gift edge cases
+
+### Gift от нужного peer + достаточная стоимость
 
 ```text
-single gift value >= required_stars_snapshot
-→ offer=PAID
+active waiting offer
+sender matches conversation peer
+stars >= required
+→ PAID
 ```
 
-Если у Telegram нет gift ровно на настроенные 30 Stars, пользователь может отправить ближайший подходящий Gift выше threshold. Позже можно добавить cumulative gifts, но не делать это обязательным сейчас.
+### Gift дешевле required
 
-### Duplicate protection
+```text
+record gift
+keep offer WAITING
+no media fulfillment
+```
 
-Один и тот же Gift event не может оплатить дважды:
+Не делать скрытое накопление нескольких gifts в MVP.
+
+### Gift без active offer
+
+```text
+record as unmatched
+matched_offer_id=NULL
+nothing is sent
+```
+
+### Gift после expired/cancelled offer
+
+Не «воскрешать» старый offer автоматически.
+
+### Gift от другого peer
+
+Никогда не оплачивает чужой offer.
+
+### Duplicate Gift/update
+
+Один event может учитываться один раз:
 
 ```text
 UNIQUE(telegram_chat_id, telegram_message_id)
 ```
 
-или другой стабильный Telegram event key, если service message устроен иначе.
+или другой подтвержденный stable key.
+
+### Gift уже использован
+
+`matched_offer_id` не может быть перепривязан ко второму offer.
 
 ---
 
-## 26. Fulfillment после Gift
+## 53. Fulfillment после оплаты
 
-LLM не нужна.
+LLM не вызывается.
 
 ```text
 Gift received
-↓
-GiftDetector
-↓
-match active offer
-↓ transaction
-Offer WAITING -> PAID
-↓
-enqueue SEND_MEDIA(selected_asset_id)
-↓
-MediaSender
-↓
-mark FULFILLED
-↓
-next normal LLM context receives system fact:
-"agreed gift received; reserved media was delivered"
+→ dedupe
+→ match waiting Offer
+→ DB transaction Offer WAITING -> PAID
+→ enqueue SEND_MEDIA(selected_asset_id)
+→ MediaSender
+→ conversation_media
+→ Offer FULFILLED
 ```
 
-### Crash safety
-
-Критический сценарий:
+После этого следующий обычный LLM context получает компактный system/domain fact:
 
 ```text
-Gift записан
-Offer=PAID
-PROCESS CRASH
-media еще не отправлено
+agreed gift received; reserved media was delivered
 ```
 
-После restart recovery worker выполняет:
+---
+
+## 54. Crash между payment и send
+
+```text
+Gift recorded
+Offer=PAID
+PROCESS CRASH
+media not sent
+```
+
+После restart:
 
 ```text
 SELECT offers
@@ -1145,73 +1487,104 @@ WHERE status='paid'
 AND fulfilled_at IS NULL
 ```
 
-и продолжает fulfillment.
+RecoveryService повторно ставит fulfillment в outbox.
 
 Оплата не теряется.
 
 ---
 
-## 27. Runtime price/config
+# ЧАСТЬ G. RUNTIME CONTROL
 
-Цена не должна быть зашита в persona prompt.
+## 55. Runtime config
 
-`runtime_config`:
+Boot-time infrastructure — `.env`.
 
-```text
-offer_price_stars = 50
-offers_enabled = true
-media_enabled = true
-anon_enabled = true
-```
+Меняемые на ходу значения — SQLite `runtime_config`.
 
-Когда создается Offer:
+Минимум:
 
 ```text
-required_stars_snapshot = runtime_config.offer_price_stars
+offer_price_stars
+anon_enabled
+offers_enabled
+media_enabled
 ```
-
-В ContextBuilder передается:
-
-```text
-если есть active offer -> его snapshot price
-иначе -> current runtime offer price
-```
-
-Так модель не путается после изменения цены.
 
 ---
 
-## 28. Админ-управление
+## 56. Точная семантика переключателей
 
-Минимально надежный интерфейс — **команды в Telegram Saved Messages**, которые ловит этот же Telethon-процесс только от собственного аккаунта.
+### `.anon stop`
 
-Пример:
+- прекращает автоматический поиск новых anon rooms;
+- завершает/останавливает anon controller согласно выбранной безопасной policy;
+- **существующие DM продолжают работать**;
+- не отключает LLM глобально.
+
+### `.anon next`
+
+- сначала инвалидирует текущий `room_generation`;
+- отменяет stale pending reply;
+- затем выполняет controlled skip/next;
+- не влияет на DM.
+
+### `.offers off`
+
+- запрещает создание новых Offers;
+- существующие `WAITING` можно либо оставить действующими до expiry, либо отдельно отменить командой — policy должна быть явной;
+- уже `PAID` offer обязательно исполняется.
+
+Рекомендуемый default: existing waiting offers остаются действующими до собственного expiry.
+
+### `.media off`
+
+- запрещает новые casual/teaser sends и новые media intents;
+- **не должен блокировать fulfillment уже PAID offer**, иначе можно получить оплату и не отправить зарезервированный asset.
+
+### `.price N`
+
+- меняет только новые Offers;
+- старые используют `required_stars_snapshot`.
+
+---
+
+## 57. Admin interface
+
+Минимальный надежный вариант — **Saved Messages** собственного Telegram-аккаунта.
+
+Команды:
 
 ```text
 .anon start
 .anon stop
 .anon next
 .anon status
+
 .price 30
 .offers on
 .offers off
 .media on
 .media off
 .media reindex
+
 .status
+.dm resume <peer/conversation>
+.dm pause <peer/conversation>
 ```
 
-Это code-only control. Такие команды никогда не идут в LLM и никогда не отправляются собеседникам.
+Admin commands:
 
-Можно оставить CLI как дополнительный offline tool для reindex/db diagnostics, но не строить web panel.
+- распознаются только от self-account;
+- никогда не идут в LLM;
+- никогда не пересылаются собеседникам.
+
+CLI можно оставить как дополнительный offline diagnostic tool.
 
 ---
 
-## 29. SQLite schema
+# ЧАСТЬ H. PERSISTENCE
 
-Используем SQLite в WAL mode.
-
-На старте:
+## 58. SQLite
 
 ```sql
 PRAGMA journal_mode=WAL;
@@ -1219,9 +1592,11 @@ PRAGMA foreign_keys=ON;
 PRAGMA busy_timeout=5000;
 ```
 
-Ниже целевая логическая схема. Типы/названия могут уточняться в миграции, но ответственность таблиц должна сохраниться.
+Один процесс + SQLite достаточно.
 
-### 29.1. `conversations`
+---
+
+## 59. `conversations`
 
 ```text
 id                    INTEGER PK
@@ -1229,193 +1604,222 @@ channel               anon | dm
 state                 active | handoff_pending | ended
 telegram_peer_id      INTEGER NULL
 anon_generation       INTEGER NULL
-created_at            DATETIME
-updated_at            DATETIME
-last_activity_at      DATETIME
-ended_at              DATETIME NULL
-end_reason            TEXT NULL
+created_at
+updated_at
+last_activity_at
+manual_override_until NULL
+ended_at              NULL
+end_reason            NULL
 ```
 
-Индекс:
+Индексы:
 
 ```text
-INDEX(channel, state)
-INDEX(telegram_peer_id)
+(channel, state)
+telegram_peer_id
 ```
 
-Для DM должно быть не более одной активной logical conversation на один peer.
+Не более одной активной DM conversation на один peer.
 
-### 29.2. `messages`
+---
+
+## 60. `messages`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK
-role                  user | assistant | system
-transport             anon | dm
-kind                  text | service | media | gift | internal
-telegram_chat_id      INTEGER NULL
-telegram_message_id   INTEGER NULL
-text                  TEXT NULL
-created_at            DATETIME
+id
+conversation_id FK
+role             user | assistant | system
+transport        anon | dm
+kind             text | service | media | gift | internal
+source           partner | llm | manual | system
+telegram_chat_id NULL
+telegram_message_id NULL
+text             NULL
+created_at
 ```
 
-Dedupe:
+Dedupe по Telegram message key, когда он существует.
+
+---
+
+## 61. `conversation_facts`
 
 ```text
-UNIQUE(telegram_chat_id, telegram_message_id)
-```
-
-где оба значения существуют.
-
-### 29.3. `conversation_facts`
-
-```text
-conversation_id       FK
-key                   TEXT
-value_json            TEXT
-confidence            REAL
-source_message_id     FK NULL
-updated_at            DATETIME
+conversation_id FK
+key
+value_json
+confidence
+source_message_id NULL
+updated_at
 PRIMARY KEY(conversation_id, key)
 ```
 
-Не создавать отдельную колонку под каждое новое свойство человека.
+Не создавать колонку для каждого нового свойства человека.
 
-### 29.4. `conversation_summaries`
+---
+
+## 62. `conversation_summaries`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK
-through_message_id    INTEGER
-summary_text          TEXT
-created_at            DATETIME
+id
+conversation_id FK
+through_message_id
+summary_text
+created_at
 ```
 
-Храним версии, чтобы при проблеме можно было восстановить прошлую.
+Хранить версии.
 
-### 29.5. `handoffs`
+---
+
+## 63. `handoffs`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK
-state                 pending | confirmed | expired | ambiguous
-anon_generation       INTEGER
-created_at            DATETIME
-deadline_at           DATETIME
-handoff_token         TEXT NULL
-dm_peer_id            INTEGER NULL
-confirmed_at          DATETIME NULL
+id
+conversation_id FK
+state pending | confirmed | expired | ambiguous
+anon_generation
+created_at
+deadline_at
+handoff_token NULL
+dm_peer_id NULL
+confirmed_at NULL
 ```
 
-### 29.6. `media_assets`
+---
+
+## 64. `media_assets`
 
 ```text
-id                    INTEGER PK
-source_chat_id        INTEGER
-source_message_id     INTEGER
-media_type            photo | video_note | video
-access_class          casual | teaser | paid
-tags_json             TEXT
-series                TEXT NULL
-enabled               BOOL
-use_count             INTEGER
-created_at            DATETIME
-updated_at            DATETIME
+id
+source_chat_id
+source_message_id
+media_type
+access_class
+tags_json
+series NULL
+description NULL
+enabled
+use_count
+created_at
+updated_at
 UNIQUE(source_chat_id, source_message_id)
 ```
 
-### 29.7. `conversation_media`
+---
+
+## 65. `conversation_media`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK
-media_asset_id        FK
-reason                casual | teaser | paid | manual
-telegram_message_id   INTEGER NULL
-sent_at               DATETIME
+id
+conversation_id FK
+media_asset_id FK
+reason casual | teaser | paid | manual
+telegram_message_id NULL
+metadata_snapshot_json
+sent_at
 UNIQUE(conversation_id, media_asset_id)
 ```
 
-Это предотвращает повтор одного asset одному человеку.
+`metadata_snapshot_json` позволяет восстановить, **что именно реально было отправлено**, даже если caption в Vault позже изменился.
 
-### 29.8. `offers`
+---
+
+## 66. `offers`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK
-status                waiting | paid | fulfilled | expired | cancelled
-required_stars        INTEGER
-media_intent_json     TEXT
-selected_asset_id     FK
-created_at            DATETIME
-expires_at            DATETIME NULL
-paid_at               DATETIME NULL
-fulfilled_at          DATETIME NULL
+id
+conversation_id FK
+status waiting | paid | fulfilled | expired | cancelled
+required_stars
+media_intent_json
+selected_asset_id FK
+created_at
+expires_at NULL
+paid_at NULL
+fulfilled_at NULL
 ```
 
-Нужен partial/logic constraint: максимум один `waiting` offer на conversation, если позже не появится причина поддерживать несколько одновременно.
+Для MVP максимум один `waiting` offer на conversation.
 
-### 29.9. `gifts`
+---
+
+## 67. `gifts`
 
 ```text
-id                    INTEGER PK
-telegram_chat_id      INTEGER
-telegram_message_id   INTEGER
-gift_ref              TEXT NULL
-sender_peer_id        INTEGER
-gift_stars            INTEGER NULL
-received_at           DATETIME
-matched_offer_id      FK NULL
+id
+telegram_chat_id
+telegram_message_id
+gift_ref NULL
+sender_peer_id
+gift_stars NULL
+received_at
+matched_offer_id NULL
 UNIQUE(telegram_chat_id, telegram_message_id)
 ```
 
-### 29.10. `runtime_config`
+---
+
+## 68. `runtime_config`
 
 ```text
-key                   TEXT PK
-value_json            TEXT
-updated_at            DATETIME
+key TEXT PK
+value_json
+updated_at
 ```
 
-### 29.11. `events`
+---
+
+## 69. `events`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK NULL
-event_type            TEXT
-payload_json          TEXT
-created_at            DATETIME
+id
+conversation_id NULL
+event_type
+payload_json
+created_at
 ```
 
-### 29.12. `outbox`
+---
 
-Для надежной отправки Telegram actions:
+## 70. `outbox`
 
 ```text
-id                    INTEGER PK
-conversation_id       FK NULL
-action_type           send_text | send_media | anon_search | anon_next | anon_stop | anon_link
-payload_json          TEXT
-idempotency_key       TEXT UNIQUE
-status                pending | processing | done | failed
-attempts              INTEGER
-available_at          DATETIME
-last_error            TEXT NULL
-created_at            DATETIME
-completed_at          DATETIME NULL
+id
+conversation_id NULL
+action_type
+payload_json
+idempotency_key UNIQUE
+status pending | processing | done | failed
+attempts
+available_at
+last_error NULL
+created_at
+completed_at NULL
 ```
 
-### 29.13. `app_state`
-
-Для restart-safe runtime:
+Типы:
 
 ```text
-key                   TEXT PK
-value_json            TEXT
-updated_at            DATETIME
+send_text
+send_media
+anon_search
+anon_next
+anon_stop
+anon_link
 ```
 
-Здесь хранится минимум:
+---
+
+## 71. `app_state`
+
+```text
+key TEXT PK
+value_json
+updated_at
+```
+
+Минимум:
 
 ```text
 anon_controller_state
@@ -1426,98 +1830,102 @@ last_search_action_at
 
 ---
 
-## 30. Transactions и exactly-once-ish semantics
+# ЧАСТЬ I. IDEMPOTENCY, RECOVERY, RETRIES
 
-Абсолютное exactly-once через Telegram недостижимо, поэтому цель — **идемпотентное at-least-once с локальной дедупликацией**.
+## 72. Exactly-once-ish semantics
 
-### Incoming
+Абсолютное exactly-once через Telegram не гарантируется.
 
-В транзакции:
+Цель:
 
-1. Проверить Telegram message/event dedupe key.
-2. Если уже обработан — return.
-3. Записать incoming message/event.
-4. Обновить `last_activity_at`.
-5. Зафиксировать transaction.
+> **idempotent at-least-once + локальная дедупликация.**
 
-### Outgoing
+Incoming:
 
-Сначала создать outbox row с уникальным `idempotency_key`, потом dispatcher отправляет.
+1. dedupe Telegram event;
+2. save message/event;
+3. update state/activity;
+4. commit.
 
-После успешной Telegram отправки:
+Outgoing:
 
-- сохранить Telegram message id;
-- пометить outbox `done`;
-- обновить соответствующий domain object.
-
-На restart незавершенный outbox можно безопасно повторно обработать согласно типу действия и idempotency checks.
+1. создать outbox row с unique `idempotency_key`;
+2. dispatcher отправляет;
+3. сохранить returned message id;
+4. mark done.
 
 ---
 
-## 31. Retry policy
+## 73. Retry LLM
 
-### LLM
-
-Retry только для временных ошибок:
+Только временные ошибки:
 
 ```text
 timeout
 connection reset
 5xx
-429/rate limit
+429
 ```
 
-Стартовая политика:
+Старт:
 
 ```text
-max attempts: 2-3
+2–3 attempts
 exponential backoff + jitter
 ```
 
-Не повторять бесконечно.
-
-Если LLM недоступна, анончат не должен автоматически скипать человека только из-за API timeout.
-
-### Telegram
-
-`FloodWait` обрабатывается как Telegram infrastructure event. Сохраняем действие и откладываем до разрешенного времени. Не просим LLM решать это.
-
-### Media reference
-
-Если cached/source media reference устарел — повторно fetch source message из vault и retry send один раз.
+API timeout сам по себе не является причиной автоматического skip собеседника.
 
 ---
 
-## 32. Startup recovery
+## 74. Retry Telegram
 
-Порядок запуска:
+FloodWait:
 
-1. Открыть DB, выполнить migrations.
-2. Включить WAL/foreign keys.
-3. Поднять Telethon session.
-4. Resolve собственный account ID, anon bot peer, media vault peer.
-5. Reconcile pending outbox.
-6. Reconcile `offers(status=paid, fulfilled_at=NULL)`.
-7. Восстановить DM conversations.
-8. Восстановить anon controller state.
-9. Если сохраненное состояние анонки сомнительно после долгого downtime — не отправлять blindly несколько `/next`. Сначала `AnonAdapter.reconcile_state()` по доступным признакам/последним сообщениям.
-10. Запустить debouncers/timers только после reconciliation.
+- сохранить/оставить outbox action;
+- отложить до разрешенного времени;
+- не спрашивать LLM, что делать.
+
+Media reference:
+
+- refetch source message;
+- один bounded retry.
 
 ---
 
-## 33. Аналитика эксперимента
+## 75. Startup recovery
 
-Все основные бизнес-события пишет **код без LLM**.
+Порядок:
 
-Рекомендуемые `event_type`:
+1. открыть SQLite;
+2. migrations;
+3. WAL/foreign keys;
+4. поднять Telethon session;
+5. resolve own account ID, anon bot peer, Vault peer;
+6. восстановить incomplete outbox;
+7. восстановить `PAID && !FULFILLED` offers;
+8. восстановить DM conversations;
+9. прочитать сохраненное anon state;
+10. **reconcile с фактическим состоянием анон-бота**, а не слепо отправлять `/next`;
+11. восстановить timers/debounce после reconciliation.
+
+---
+
+# ЧАСТЬ J. АНАЛИТИКА И СТОИМОСТЬ
+
+## 76. События аналитики
+
+Без LLM:
 
 ```text
 app_started
 anon_search_started
+anon_search_watchdog
 anon_room_started
 anon_first_message
 anon_message_received
 anon_reply_sent
+anon_no_reply
 anon_idle_timeout
 anon_partner_left
 anon_manual_skip
@@ -1525,11 +1933,16 @@ handoff_offered
 handoff_link_requested
 handoff_confirmed
 handoff_expired
+handoff_ambiguous
 dm_started
 dm_message_received
+manual_message_sent
+manual_override_started
 offer_created
 offer_price_snapshot
 gift_received
+gift_unmatched
+gift_insufficient
 offer_paid
 offer_expired
 media_selected
@@ -1541,55 +1954,177 @@ llm_schema_error
 telegram_flood_wait
 ```
 
-Это позволит считать без модели:
+---
+
+## 77. Метрики
+
+Считать кодом:
 
 ```text
 anon rooms → handoff rate
 handoff → DM rate
 DM → offer rate
-offer 30 Stars → gift conversion
-offer 50 Stars → gift conversion
+offer 30 Stars → Gift conversion
+offer 50 Stars → Gift conversion
 average messages before handoff
 average messages before offer
 idle/skip rate
+media category request frequency
+LLM calls per conversation
 LLM cost per conversation
 ```
 
 ---
 
-## 34. Стоимость LLM и основные рычаги экономии
+## 78. Usage accounting
 
-Архитектура должна экономить не «хитрыми промптами», а количеством и размером вызовов.
-
-Главные рычаги:
-
-1. Debounce пачек сообщений.
-2. Никаких LLM-вызовов на timers/search/stop/next/Gift/payment/media lookup.
-3. Facts извлекаются внутри обычного response call.
-4. Stable system/persona prefix.
-5. Ограниченный recent history.
-6. Rolling summary вместо полной истории.
-7. Summary обновляется редко по threshold.
-8. Короткий `max_output_tokens` для Telegram.
-9. Thinking OFF для обычного чата.
-10. Media selection полностью локально.
-11. Возможность заменить API на локальную модель.
-
-Поля `usage` из LLM response сохранять в analytics, если provider их возвращает:
+Сохранять provider usage, если доступно:
 
 ```text
 input_tokens
-cached_input_tokens (если доступно)
+cached_input_tokens
 output_tokens
 model
 latency_ms
 ```
 
-Так реальная стоимость считается по факту, а не по предположениям.
+Это источник истины по расходам.
 
 ---
 
-## 35. Предлагаемая структура файлов
+## 79. Примерная модель стоимости LLM
+
+Точные тарифы провайдера меняются, поэтому архитектура **не должна зашивать цену в код**. Расчет ниже — методика, а не постоянная тарифная константа.
+
+Для оценки допустим:
+
+```text
+1 conversation ≈ 20 LLM turns after debounce
+average effective input ≈ 2,000 tokens/turn
+average output ≈ 80 tokens/turn
+```
+
+Тогда на один разговор:
+
+```text
+input  ≈ 40,000 tokens
+output ≈ 1,600 tokens
+```
+
+На 100 разговоров:
+
+```text
+input  ≈ 4.0M tokens
+output ≈ 0.16M tokens
+```
+
+На 1000 разговоров:
+
+```text
+input  ≈ 40M tokens
+output ≈ 1.6M tokens
+```
+
+Фактическая стоимость считается:
+
+```text
+(cost_input_miss × miss_tokens)
++ (cost_input_cache × cached_tokens)
++ (cost_output × output_tokens)
+```
+
+Главные рычаги экономии:
+
+1. debounce;
+2. `no_reply` там, где он семантически уместен;
+3. никакой LLM на timers/search/next/stop/Gifts/media lookup;
+4. facts внутри основного reply call;
+5. stable prompt prefix;
+6. ограниченный recent history;
+7. summary по threshold;
+8. короткий max output;
+9. thinking OFF;
+10. локальный MediaSelector;
+11. возможность локальной LLM.
+
+Для реального бюджета использовать только фактические `usage` логи выбранного provider.
+
+---
+
+# ЧАСТЬ K. CONFIG, SECRETS, DEPLOYMENT
+
+## 80. Boot-time `.env`
+
+```dotenv
+TG_API_ID=
+TG_API_HASH=
+TG_SESSION_NAME=anonka_session
+
+ANON_BOT_USERNAME=
+ANON_SEARCH_COMMAND=
+ANON_NEXT_COMMAND=
+ANON_STOP_COMMAND=
+ANON_LINK_COMMAND=/link
+ANON_IDLE_TIMEOUT_SECONDS=600
+ANON_SEARCH_WATCHDOG_SECONDS=90
+
+MEDIA_VAULT_CHAT_ID=
+
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=
+LLM_MODEL=deepseek-v4-flash
+LLM_TIMEOUT_SECONDS=45
+LLM_MAX_OUTPUT_TOKENS=500
+LLM_MAX_CONCURRENCY=4
+LLM_THINKING=disabled
+
+MESSAGE_DEBOUNCE_MS=1800
+MANUAL_OVERRIDE_SECONDS=60
+DATABASE_PATH=data/anonka.sqlite3
+LOG_LEVEL=INFO
+DRY_RUN=false
+```
+
+Runtime `price/on/off` не хранить в `.env`.
+
+---
+
+## 81. Secrets
+
+MUST:
+
+- `.env` gitignored;
+- Telethon `.session` gitignored;
+- SQLite DB gitignored;
+- API key не попадает в logs;
+- Telegram session file считать секретом уровня пароля;
+- Vault приватный;
+- полный plaintext чатов в console logs по умолчанию не печатать;
+- делать безопасный backup SQLite.
+
+---
+
+## 82. Deployment
+
+MVP:
+
+```text
+один Windows/Linux ПК или VPS
+один Python process
+одна Telethon session
+одна SQLite DB
+```
+
+Не запускать два активных экземпляра с одной и той же session/DB без отдельной leader-lock архитектуры.
+
+Добавить простой process lock/DB lock, чтобы случайно не поднять второй экземпляр.
+
+---
+
+# ЧАСТЬ L. ФАЙЛОВАЯ СТРУКТУРА
+
+## 83. Целевая структура
 
 ```text
 ai_chat_experiment/
@@ -1619,11 +2154,13 @@ ai_chat_experiment/
 │   │   ├── parser.py
 │   │   ├── controller.py
 │   │   ├── state.py
+│   │   ├── reconciliation.py
 │   │   └── timers.py
 │   │
 │   ├── dm/
 │   │   ├── adapter.py
-│   │   └── handoff.py
+│   │   ├── handoff.py
+│   │   └── manual_override.py
 │   │
 │   ├── conversation/
 │   │   ├── service.py
@@ -1662,10 +2199,11 @@ ai_chat_experiment/
 │   └── runtime/
 │       ├── outbox.py
 │       ├── recovery.py
-│       └── scheduler.py
+│       ├── scheduler.py
+│       └── instance_lock.py
 │
 ├── data/
-│   └── anonka.sqlite3          # gitignored
+│   └── anonka.sqlite3
 ├── tests/
 ├── .env
 ├── .env.example
@@ -1673,255 +2211,271 @@ ai_chat_experiment/
 └── run.py
 ```
 
-Это логическое целевое разбиение. Не обязательно создавать все файлы одним коммитом; вводить по этапам.
+Вводить структуру поэтапно, а не создавать десятки пустых файлов одним коммитом.
 
 ---
 
-## 36. Конфигурация
+# ЧАСТЬ M. SEQUENCE FLOWS
 
-`.env` — только secrets и boot-time infrastructure settings.
+## 84. Новый anonymous conversation
 
-Пример целевых env:
-
-```dotenv
-TG_API_ID=
-TG_API_HASH=
-TG_SESSION_NAME=anonka_session
-
-ANON_BOT_USERNAME=
-ANON_SEARCH_COMMAND=
-ANON_NEXT_COMMAND=
-ANON_STOP_COMMAND=
-ANON_LINK_COMMAND=/link
-ANON_IDLE_TIMEOUT_SECONDS=600
-
-MEDIA_VAULT_CHAT_ID=
-
-LLM_PROVIDER=openai_compatible
-LLM_BASE_URL=https://api.deepseek.com
-LLM_API_KEY=
-LLM_MODEL=deepseek-v4-flash
-LLM_TIMEOUT_SECONDS=45
-LLM_MAX_OUTPUT_TOKENS=500
-LLM_MAX_CONCURRENCY=4
-LLM_THINKING=disabled
-
-MESSAGE_DEBOUNCE_MS=1800
-DATABASE_PATH=data/anonka.sqlite3
-LOG_LEVEL=INFO
-DRY_RUN=false
-```
-
-Меняемые во время работы значения (`price`, offers/media/anon on/off) — в `runtime_config`, не в `.env`.
-
----
-
-## 37. Секреты и файлы
-
-MUST:
-
-- `.env` не коммитить;
-- Telethon `.session` не коммитить;
-- SQLite DB не коммитить;
-- API keys не писать в logs;
-- media vault приватный;
-- логирование полного текста переписок сделать отдельной настраиваемой опцией, а не обязательным console output;
-- периодически копировать SQLite через безопасный backup mechanism;
-- Telegram session file считать секретом уровня пароля аккаунта.
-
----
-
-## 38. Sequence flows
-
-### 38.1. Новый anonymous match
+Если есть room-ready signal:
 
 ```text
-Admin/start
+admin/start
 → AnonController SEARCHING
-→ AnonAdapter search
-→ room ready signal (если доступен)
+→ AnonAdapter.search
+→ observed ROOM_READY
 → create Conversation(channel=anon, facts={})
 → ROOM_ACTIVE
-→ optional opener LLM
+→ optional first LLM opener
 ```
 
-Если room-ready signal отсутствует:
+Если сигнала нет:
 
 ```text
 SEARCHING
 → first partner message
-→ create Conversation
+→ create Conversation(facts={})
 → ROOM_ACTIVE
 → debounce
 → LLM
 ```
 
-### 38.2. Пачка сообщений
+---
+
+## 85. Пачка сообщений
 
 ```text
 msg1
 → pending batch
-msg2 after 0.4s
+msg2 0.4s later
 → reset debounce
-msg3 after 0.7s
+msg3 0.7s later
 → reset debounce
 1.8s silence
 → combine
-→ one LLM request
-→ validate schema
-→ save facts
-→ execute allowed intents
-→ typing/delivery delay
-→ send
+→ one LLM call
+→ validate ChatDecision
+→ apply facts/intents
+→ target delay/typing
+→ send or no_reply
 ```
 
-### 38.3. Idle skip
+---
+
+## 86. Idle skip
 
 ```text
 ROOM_ACTIVE
 → no meaningful activity 600s
-→ generation++ / cancel stale job
-→ close conversation end_reason=idle_timeout
-→ AnonAdapter.next()
-→ SEARCHING
-```
-
-### 38.4. Partner skips us
-
-```text
-AnonAdapter recognizes partner_left/skip
-→ cancel timer
-→ invalidate room_generation
+→ invalidate generation
 → close conversation
-→ SEARCHING
-→ search next if bot did not already do it automatically
+→ AnonAdapter.next
+→ observed SEARCHING
 ```
 
-### 38.5. Handoff
+---
+
+## 87. Partner skips first
 
 ```text
-LLM returns handoff_intent=offer
-→ code request_link()
+observed PARTNER_LEFT
+→ invalidate generation
+→ cancel timer/stale task
+→ close conversation
+→ if bot already searches: reconcile only
+→ else search next
+```
+
+---
+
+## 88. Search watchdog
+
+```text
+SEARCHING
+→ 90s without room
+→ reconcile observed bot state
+→ search still active: wait/backoff
+→ stopped: retry search
+→ unknown: bounded retry, log/alert
+```
+
+---
+
+## 89. Handoff
+
+```text
+LLM handoff_intent
+→ code /link
 → HANDOFF_PENDING
-→ new unknown DM appears in handoff window
+→ new unknown DM appears
 → correlate/confirm
-→ bind current conversation.telegram_peer_id
-→ channel=dm
-→ handoff confirmed
-→ anon generation invalidated
-→ AnonController SEARCHING
-→ DM conversation continues independently
+→ same conversation channel=dm
+→ bind peer_id
+→ invalidate anon generation
+→ AnonController starts next search
+→ DM continues
 ```
 
-### 38.6. Новый anon while old DM continues
+---
+
+## 90. Несколько параллельных DM
 
 ```text
-DM #184 incoming ──► lock #184 ──► LLM job A
-Anon #185 incoming ─► lock #185 ──► LLM job B
-DM #173 incoming ──► lock #173 ──► LLM job C
+DM #184 → lock #184 → LLM A
+Anon #201 → lock #201 → LLM B
+DM #173 → lock #173 → LLM C
 
-Global LLM semaphore controls concurrency.
-No context is shared between #184/#185/#173.
+Global semaphore limits total LLM concurrency.
 ```
 
-### 38.7. Semantically requested media
+---
+
+## 91. Manual owner message
 
 ```text
-USER: asks for specific kind of media
-→ LLM MediaIntent(content=..., type=...)
-→ MediaSelector exact match
-→ exclude already sent
-→ select top candidate
-→ if casual/teaser: enqueue send
-→ if paid: create/reserve offer instead
+LLM job pending
+→ owner manually sends text in Telegram
+→ outgoing event detected
+→ persist manual text
+→ mark pending AI job stale
+→ MANUAL_OVERRIDE 60s
+→ no duplicate AI reply
+→ auto-resume after cooldown
 ```
 
-### 38.8. Gift -> paid media
+---
+
+## 92. Semantic media request
 
 ```text
-Offer waiting, price snapshot=50, asset=731
-→ Telegram gift service event from same DM peer
-→ dedupe gift
-→ verify value >= 50
-→ transaction Offer=PAID + gift matched
-→ outbox SEND_MEDIA asset=731
-→ send from vault
-→ conversation_media insert
+USER asks specific media
+→ LLM MediaIntent
+→ MediaSelector
+→ exact tags / allowed fallback
+→ exclude sent
+→ casual/teaser: send
+→ paid: create Offer reservation
+```
+
+---
+
+## 93. Gift → paid media
+
+```text
+Offer WAITING price=50 asset=731
+→ Gift from same DM peer value>=50
+→ dedupe
+→ transaction Offer=PAID + Gift matched
+→ outbox SEND_MEDIA 731
+→ fetch fresh source media
+→ send
+→ conversation_media metadata snapshot
 → Offer=FULFILLED
 ```
 
-### 38.9. Restart between payment and send
+---
+
+## 94. Restart после Gift
 
 ```text
-DB: offer=PAID, fulfilled_at=NULL
+Offer=PAID
+fulfilled_at=NULL
 PROCESS CRASH
 → restart
-→ RecoveryService query pending paid offers
-→ re-enqueue missing SEND_MEDIA
-→ send
-→ mark fulfilled
+→ RecoveryService
+→ re-enqueue SEND_MEDIA
+→ fulfill
 ```
 
-### 38.10. Old LLM response after anon skip
+---
+
+## 95. Старый LLM ответ после anon skip
 
 ```text
 job generation=40
-→ room changes generation=41
+→ room generation becomes 41
 → job finishes
-→ pre-send guard sees 40 != 41
+→ pre-send guard sees mismatch
 → DROP
 ```
 
 ---
 
-## 39. Testing strategy
+# ЧАСТЬ N. TESTING
 
-### Unit tests MUST
+## 96. Unit tests MUST
 
 - anon state transitions;
-- 10-minute timeout;
-- repeated `partner_left` event is idempotent;
-- stale generation response dropped;
-- debounce combines messages;
-- one conversation cannot mix history with another;
+- room creation without profile metadata;
+- idle timeout;
+- SEARCHING watchdog;
+- observed-state reconciliation;
+- repeated `partner_left` idempotent;
+- stale generation dropped;
+- debounce batches messages;
+- no context mixing;
+- manual outgoing message stored;
+- manual override blocks duplicate AI response;
+- `no_reply` does not end conversation;
 - facts upsert;
+- handoff confirmation/expiry/ambiguity;
 - media caption parser;
-- media selector exact tags;
-- media selector never repeats asset to same conversation;
-- `breasts` request does not silently choose `butt`-only asset;
-- offer price snapshot survives runtime price change;
-- duplicate gift does not double-pay;
-- gift from wrong peer cannot pay offer;
-- paid-but-unfulfilled offer recovers after restart;
-- outbox idempotency.
-
-### Integration tests SHOULD
-
-- fake OpenAI-compatible server;
-- fake/fixture Telethon messages;
-- raw service message fixture for Gift;
-- media vault fetch/send mock;
-- SQLite restart between every important state transition;
-- FloodWait simulation;
-- invalid LLM JSON/schema response.
-
-### Dry run
-
-Существующий `DRY_RUN` сохранить и расширить:
-
-- Telegram outgoing action логируется, но не отправляется;
-- state machine и DB работают реально;
-- LLM можно включать отдельно или заменить `FakeLLMProvider`.
+- selector exact tags;
+- no repeat to same conversation;
+- `breasts` request never silently selects `butt`-only asset;
+- real sent-media metadata appears in subsequent context;
+- offer price snapshot survives `.price` change;
+- wrong-peer Gift cannot pay offer;
+- insufficient Gift stays waiting;
+- unmatched Gift sends nothing;
+- expired offer not resurrected;
+- duplicate Gift not double-counted;
+- PAID fulfillment ignores `.media off` and still completes;
+- paid-but-unfulfilled recovery;
+- outbox idempotency;
+- second app instance lock.
 
 ---
 
-## 40. Логирование/наблюдаемость
+## 97. Integration tests SHOULD
 
-Каждый значимый log должен иметь structured context:
+- fake OpenAI-compatible server;
+- fake Telethon messages;
+- real captured anonymous-bot fixtures;
+- `MessageEdited`/reply-markup state fixture;
+- real captured Gift raw fixture;
+- media Vault fetch/send mock;
+- restart after every critical DB transition;
+- FloodWait simulation;
+- expired file reference simulation;
+- invalid LLM JSON;
+- local-model compatibility test.
+
+---
+
+## 98. DRY_RUN
+
+Существующий `DRY_RUN` сохранить и расширить:
+
+- state machine и DB работают реально;
+- outgoing Telegram actions не отправляются;
+- actions логируются;
+- LLM можно использовать реальную или `FakeLLMProvider`;
+- Gift/media fixtures можно проигрывать локально.
+
+---
+
+# ЧАСТЬ O. LOGGING
+
+## 99. Structured logging
+
+Поля:
 
 ```text
 conversation_id
-telegram_peer_id (если известен)
+telegram_peer_id
 anon_generation
 event_type
 llm_model
@@ -1932,15 +2486,15 @@ offer_id
 
 Не логировать secrets.
 
-Полные тексты переписок в логах по умолчанию не нужны, потому что они уже есть в SQLite.
-
-Ошибки должны содержать stack trace + correlation IDs.
+Полные тексты чатов в console logs по умолчанию не нужны — они уже в SQLite.
 
 ---
 
-## 41. Dependency recommendations
+# ЧАСТЬ P. DEPENDENCIES
 
-Runtime минимум:
+## 100. Runtime dependencies
+
+Минимум:
 
 ```text
 telethon
@@ -1957,260 +2511,243 @@ pytest
 pytest-asyncio
 ```
 
-Не добавлять большой framework без реальной необходимости.
+Не добавлять framework без необходимости.
 
-`openai.AsyncOpenAI` использовать как OpenAI-compatible transport.
-
-Для migrations можно начать с собственного простого последовательного migration runner (`schema_version` + SQL files), вместо Alembic. Если БД сильно вырастет по сложности — Alembic можно добавить позже.
+Migrations можно начать простым `schema_version + ordered SQL migrations`; Alembic не обязателен для такого MVP.
 
 ---
 
-## 42. План миграции существующего проекта
+# ЧАСТЬ Q. ПЛАН РЕФАКТОРИНГА
 
-### Этап 1 — фундамент и persistence
-
-Сохранить Telethon startup.
-
-Добавить:
+## 101. Этап 1 — persistence/domain
 
 - SQLite/WAL;
 - migrations;
-- domain models;
+- conversations/messages/events;
 - repositories;
-- persistent conversations/messages;
-- event logging.
+- instance lock;
+- убрать RAM-only историю как источник истины.
 
-Убрать зависимость runtime chat history от RAM-only `SessionStore`.
+## 102. Этап 2 — provider-agnostic async LLM
 
-### Этап 2 — provider-agnostic LLM
+- `XAI_*` → `LLM_*`;
+- `GrokClient` → `OpenAICompatibleProvider`;
+- `AsyncOpenAI`;
+- Pydantic ChatDecision;
+- убрать `action=end`;
+- добавить `no_reply`.
 
-Заменить:
+## 103. Этап 3 — ConversationService
 
-```text
-GrokClient
-XAI_*
-```
-
-на:
-
-```text
-LLMProvider
-OpenAICompatibleProvider
-LLM_*
-```
-
-Перейти на async client.
-
-Убрать `action=end`.
-
-Ввести Pydantic `ChatDecision`.
-
-### Этап 3 — новый ConversationService
-
-Добавить:
-
-- per-conversation locks;
+- locks;
 - debounce;
-- recent history;
-- fact updates;
+- facts;
 - ContextBuilder;
-- human-like delivery timing.
+- recent history;
+- target delivery timing;
+- outgoing/manual event ingestion;
+- manual override.
 
-Удалить автоматическое завершение на `ок`/`пон`.
+## 104. Этап 4 — AnonAdapter/Controller
 
-### Этап 4 — AnonAdapter + AnonController
-
-Добавить:
-
-- bot-specific parser;
-- commands/buttons adapter;
+- protocol reconnaissance конкретного bot;
+- event parser;
+- commands/buttons;
 - state machine;
+- observed-state reconciliation;
 - idle timeout;
+- SEARCHING watchdog;
 - generation guard;
-- manual stop/next/start;
-- reconciliation after restart.
+- admin start/stop/next.
 
-### Этап 5 — DM Router + Handoff
+## 105. Этап 5 — DM/Handoff
 
-Добавить:
-
-- routing ordinary DMs by peer ID;
+- routing ordinary DM by peer ID;
 - pending handoff;
-- mapping anon conversation -> new DM;
-- conversation channel migration;
-- automatic search-next after confirmed handoff.
+- temporal/token correlation;
+- ambiguity handling;
+- same conversation migration anon→dm;
+- auto-search next after confirmed DM.
 
-### Этап 6 — Persona/facts/summary
+## 106. Этап 6 — persona/context/summary
 
-Добавить:
-
-- persona prompt files;
+- prompt files;
 - few-shot examples;
-- facts storage;
-- rolling summary thresholds;
-- separate anon/DM context budgets.
+- separate anon/DM budgets;
+- rolling summary threshold;
+- stable prefix ordering.
 
-### Этап 7 — Media Vault
-
-Добавить:
+## 107. Этап 7 — Media Vault
 
 - channel indexer;
-- metadata parser;
-- `media_assets`;
-- `MediaIntent`;
-- local selector;
-- no-repeat tracking;
-- video note sending;
-- refresh of source message/media reference.
+- tags;
+- selector;
+- no-repeat;
+- actual-sent metadata snapshot;
+- video note send;
+- refetch expired media reference.
 
-### Этап 8 — Offers/Gifts
-
-Добавить:
+## 108. Этап 8 — Offers/Gifts
 
 - runtime price;
 - asset reservation;
-- offers;
+- Gift raw fixture;
 - GiftDetector;
-- gift dedupe/matching;
-- paid fulfillment;
-- crash recovery.
+- edge-case policies;
+- fulfillment/recovery.
 
-### Этап 9 — Outbox/recovery hardening
-
-Добавить:
+## 109. Этап 9 — Outbox/hardening
 
 - idempotent outgoing actions;
 - retry/backoff;
-- FloodWait handling;
+- FloodWait;
 - startup reconciliation;
 - backup procedure.
 
-### Этап 10 — Analytics/admin
+## 110. Этап 10 — Analytics/admin
 
-Добавить:
-
-- Saved Messages admin commands;
+- Saved Messages commands;
 - funnel events;
-- price comparison reports;
-- LLM usage/cost metrics.
+- cost metrics;
+- price experiments.
 
 ---
 
-## 43. Что сохранить из текущей структуры
+# ЧАСТЬ R. MUST / SHOULD / LATER
 
-Сохранить концептуально:
+## 111. MUST для рабочего MVP
 
-- `app/main.py` как composition root;
-- `app/tg/client.py` как место создания Telethon client;
-- `app/tg/sender.py` как низкоуровневый Telegram sender, но расширить;
-- `app/config.py`, но сделать provider-neutral;
-- `DRY_RUN`;
-- разделение Telegram / LLM / services.
-
-Переписать/заменить:
-
-- `app/tg/handlers.py` → тонкий EventRouter;
-- `app/tg/filters.py` → router classification, а не один username target;
-- `app/chat/session.py` → persistent ConversationService/repositories;
-- `app/chat/state.py` → нормальные enums/state machines;
-- `app/llm/grok_client.py` → async provider adapter;
-- `app/llm/prompts.py` → prompt files + ContextBuilder;
-- `ReplyService` → LLMService + ConversationService/ActionCoordinator;
-- фиксированный `delay_service.py` → DeliveryPolicy.
-
-Удалить как концепцию:
-
-- `SHORT_ENDINGS={"ок","пон"}` как auto-end;
-- LLM `action=end`;
-- reset всей истории после естественной короткой реплики;
-- xAI-specific naming в core logic.
-
----
-
-## 44. MUST / SHOULD / LATER
-
-### MUST для рабочего MVP
-
-- Telethon user account;
-- один anon adapter;
+- one Telethon user-account;
+- one anonymous bot adapter;
+- no assumed profile metadata;
 - anon state machine;
-- 10m idle skip;
-- restart-safe SQLite;
-- независимые conversation contexts;
-- anon -> DM handoff;
-- параллельные DMs;
+- continuous observed-state reconciliation;
+- 10-minute idle skip;
+- SEARCHING watchdog;
+- SQLite restart safety;
+- one conversation per person;
+- anon→DM handoff preserving same context;
+- parallel DMs;
 - provider-neutral async LLM;
 - DeepSeek V4 Flash default, thinking off;
+- easy local OpenAI-compatible switch;
 - debounce;
-- persona + few-shot style;
-- facts from conversation;
-- media vault channel;
-- semantic media tags;
+- `no_reply`;
+- persona/few-shot;
+- facts extracted in normal reply call;
+- manual outgoing event capture;
+- MANUAL_OVERRIDE;
+- stale generation guard;
+- Media Vault;
+- semantic tags;
 - local MediaSelector;
-- no repeat per conversation;
-- runtime price;
+- actual-sent media metadata fed back into future context;
+- no-repeat;
+- runtime Gift threshold/price;
 - Offer with price+asset snapshot;
-- GiftDetector;
-- local payment/fulfillment logic;
-- stale generation protection;
-- dedupe;
-- basic recovery;
+- GiftDetector with strict peer/dedupe matching;
+- Gift edge cases;
+- fulfillment without LLM;
+- crash recovery;
 - admin start/stop/next/price/reindex;
+- runtime-toggle semantics;
 - event analytics.
 
-### SHOULD после первого работающего цикла
+## 112. SHOULD после первого работающего цикла
 
 - rolling summary;
 - outbox for every outgoing action;
-- active series continuity;
-- smarter cancel of in-flight LLM jobs;
-- detailed cost metrics;
-- Saved Messages status reports;
+- series continuity;
+- smarter cancellation of in-flight LLM;
+- detailed provider cost reports;
 - automatic DB backup;
-- local-model fallback/provider switch tests.
+- local primary + DeepSeek fallback option;
+- richer status command.
 
-### LATER / только если появится реальная необходимость
+## 113. LATER
 
-- mood/relationship numeric state;
-- automatic vision media tagging;
-- cumulative multiple Gifts per offer;
+- numeric relationship state;
+- automatic vision tagging;
+- cumulative gifts;
 - multiple personas;
 - Postgres;
 - Redis;
 - distributed workers;
 - web dashboard;
 - Business Bot;
-- runtime image/video generation.
+- runtime media generation.
 
 ---
 
-## 45. Definition of Done для первой полноценной версии
+# ЧАСТЬ S. ВЕРСИИ И ВНЕШНИЕ API
 
-Версия считается архитектурно готовой, если можно выполнить следующий сценарий без ручного вмешательства:
+## 114. Version pinning
+
+Telegram/Telethon/DeepSeek API меняются, поэтому перед реализацией adapter-sensitive частей нужно зафиксировать версии в `requirements.txt`/lock file.
+
+Особенно чувствительны:
+
+- Telethon Gift service-message types;
+- raw MTProto update types;
+- video-note/media resend semantics;
+- DeepSeek thinking/structured-output параметры.
+
+Не строить доменную архитектуру вокруг нестабильного конкретного имени Telethon raw class. Это detail Adapter layer.
+
+---
+
+## 115. Рекомендуемые официальные источники для проверки при реализации
+
+Проверять актуальное состояние на дату реализации:
+
+- Telegram MTProto/API: `https://core.telegram.org/api`
+- Telegram Gifts/Stars: `https://core.telegram.org/api/gifts`
+- Telegram API links: `https://core.telegram.org/api/links`
+- Telethon docs: `https://docs.telethon.dev/`
+- DeepSeek API docs: `https://api-docs.deepseek.com/`
+- DeepSeek thinking mode: `https://api-docs.deepseek.com/guides/thinking_mode`
+- DeepSeek multi-round chat: `https://api-docs.deepseek.com/guides/multi_round_chat`
+- DeepSeek pricing: `https://api-docs.deepseek.com/quick_start/pricing/`
+
+Документ фиксирует архитектурный контракт. Exact raw field names и актуальные тарифы всегда подтверждаются официальной документацией и fixture tests непосредственно перед реализацией.
+
+---
+
+# ЧАСТЬ T. DEFINITION OF DONE
+
+## 116. Первая полноценная версия считается готовой, если
 
 ```text
-1. Запустить приложение.
-2. Оно начинает поиск в анончате.
-3. Появляется новый человек без каких-либо исходных данных.
-4. AI ведет обычную переписку.
-5. Несколько быстрых сообщений объединяются в один LLM call.
-6. Имя/возраст/город, если они всплыли, сохраняются как facts.
-7. Через 10 минут полной неактивности код сам скипает человека.
-8. Если собеседник скипнул первым, старый pending LLM ответ никогда не попадает следующему.
-9. AI может предложить переход в ЛС; код вызывает `/link`.
-10. После подтвержденного нового DM этот же conversation продолжает жить в ЛС с прошлой памятью.
-11. Анон-контроллер сразу начинает поиск следующего человека.
-12. Старый DM и новый anon работают параллельно.
-13. Пользователь может запросить конкретное медиа.
-14. LLM возвращает MediaIntent, а код выбирает релевантный заранее размеченный asset.
-15. Один и тот же asset этому человеку повторно не отправляется.
-16. Для paid content создается Offer с фиксированными ценой и asset.
-17. Полученный подходящий Gift локально переводит Offer в PAID.
-18. Код отправляет зарезервированное медиа без дополнительного LLM-вызова.
-19. Если процесс упал после Gift, но до отправки, после restart fulfillment продолжается.
-20. `.price 30` меняет только новые Offers; старые остаются по старой цене.
-21. `.anon stop/start/next/status` работает без LLM.
-22. Переключение DeepSeek на локальный OpenAI-compatible endpoint требует только конфигурации/adapter settings, а не переписывания Telegram/DB/media logic.
+1. Приложение запускается и восстанавливает SQLite state.
+2. Начинает/восстанавливает поиск в анончате.
+3. Новый человек появляется без исходной анкеты; создается facts={}. 
+4. AI ведет обычный разговор.
+5. Быстрые сообщения объединяются debounce.
+6. Имя/возраст/город и другие факты сохраняются, если реально всплыли.
+7. LLM может выбрать no_reply без завершения разговора.
+8. Через 10 минут неактивности код скипает комнату без LLM.
+9. Если SEARCHING завис, watchdog делает reconcile/retry без спама.
+10. Если человек скипнул, старый pending LLM ответ никогда не уходит следующему.
+11. Если владелец вручную нажал next/stop, observed state корректно синхронизируется.
+12. Если владелец вручную написал человеку, сообщение входит в историю и AI временно не дублирует ответ.
+13. AI может предложить переход; код вызывает /link.
+14. После подтвержденного нового DM тот же conversation продолжает жить в ЛС.
+15. AnonController сразу начинает искать следующего человека.
+16. Старый DM и новый anon работают параллельно.
+17. LLM возвращает MediaIntent, но никогда не выбирает message_id.
+18. MediaSelector подбирает релевантный unsent asset по тегам.
+19. Запрос груди не превращается автоматически в нерелевантный butt-only asset.
+20. После отправки в будущий контекст попадают metadata реально отправленного asset.
+21. Для paid media создается Offer с asset+price snapshot.
+22. .price меняет только новые Offers.
+23. Gift от нужного peer и достаточной стоимости локально переводит Offer в PAID.
+24. Недостаточный/unmatched/wrong-peer/duplicate Gift не приводит к ошибочной выдаче.
+25. PAID fulfillment выполняется кодом без дополнительного LLM call.
+26. .media off не ломает fulfillment уже оплаченного Offer.
+27. Crash между Gift и send восстанавливается после restart.
+28. .anon stop не отключает существующие DM.
+29. DeepSeek можно заменить локальным OpenAI-compatible endpoint конфигурацией.
+30. Реальная стоимость считается по usage logs, а не по догадкам.
 ```
 
-Если все эти пункты выполняются, архитектура решает согласованную задачу без лишнего раздувания проекта.
+Если выполняются эти 30 пунктов, система соответствует согласованной архитектуре и не содержит ненужного раздувания для текущей задачи.
