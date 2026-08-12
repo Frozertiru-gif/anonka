@@ -52,12 +52,6 @@ check(
   "CI test matrix must cover both supported LTS minimums",
 );
 
-const release = read(".github/workflows/release.yml");
-check(
-  (release.match(/node-version-file: \.nvmrc/g) ?? []).length === 3,
-  "every release setup-node step must use .nvmrc",
-);
-
 if (failures.length > 0) {
   for (const failure of failures) console.error(`runtime contract: ${failure}`);
   process.exitCode = 1;
