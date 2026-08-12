@@ -29,7 +29,7 @@
 - debounce;
 - transport offsets как watermark;
 - low-level media download/send primitives;
-- low-level Gifts/Stars parsing/reconciliation primitives;
+- low-level Gifts parsing + Stars ledger/ingestion primitives;
 - LLM provider/model infrastructure;
 - `better-sqlite3`, WAL, PRAGMA, migrations pattern;
 - Pino logger и redaction;
@@ -659,22 +659,40 @@ Vision/LLM auto-tagging не делать.
 
 ## 4.9. Commerce / Gifts
 
-Создать:
+Создать/довести:
 
 ```text
 src/domain/commerce/
 ```
 
-### Gift states
+### Gift attribution
+
+Канонический source of truth — входящий Telegram `GiftEvent`.
 
 ```text
-DETECTED
-UNMATCHED
-MATCHED
-CONSUMED
+GiftEvent
+→ dedupe
+→ sender/value validation
+→ current conversation sender OR pending expectation
+   ├── match → CONFIRMED + profit once
+   └── no/ambiguous/mismatch → MANUAL_REVIEW
 ```
 
-Anonymous/ambiguous Gift остаётся `UNMATCHED` и автоматически ничего не оплачивает.
+`nameHidden` не означает anonymous sender. Если Telegram sender известен, он остаётся usable.
+
+Stars transaction history не используется как обязательный Gift matcher. Она остаётся audit/ledger infrastructure.
+
+### Manual review
+
+Control Bot должен уметь:
+
+```text
+list pending reviews
+CONFIRM eventKey
+REJECT eventKey
+```
+
+`CONFIRM` принимает attribution, начисляет известный profit один раз и закрывает pending expectation для этого chat. `REJECT` profit не начисляет и expectation не закрывает.
 
 ### Offer states
 
@@ -687,6 +705,8 @@ CANCELLED
 EXPIRED
 BLOCKED
 ```
+
+DIRECT_SALE Offer переходит в `PAID` только после confirmed Gift attribution + reliable value/context. При сомнении — manual review.
 
 ### Paid fulfillment
 
@@ -850,9 +870,9 @@ SDK как публичный Teleton product Anonka не нужен.
 5. Photo/video/video_note send/receive.
 6. Vault history scan.
 7. Vault media resend без forward attribution.
-8. Реальный Gift fixture.
-9. `nameHidden`/anonymous Gift fixture.
-10. Stars transaction reconciliation spike.
+8. Реальный Gift event/fixture: sender/value/event key доходят до GiftLedger.
+9. `nameHidden` edge case: известный sender не теряется; unknown/mismatch уходит в MANUAL_REVIEW.
+10. Stars transaction ingestion/normalization/pagination spike как audit/ledger primitive, без mandatory Gift reconciliation.
 11. Manual vs programmatic outgoing correlation spike.
 12. Pre-send MTProto correlation/idempotency spike.
 13. Отдельный `creator login`/setup flow; worker без session возвращает `AUTH_REQUIRED`.
@@ -936,16 +956,17 @@ Customer message больше не должен идти через старый
 
 ## Phase 5 — Commerce
 
-1. Normalize GiftEvent.
-2. DETECTED/UNMATCHED/MATCHED/CONSUMED.
-3. reconciliation.
-4. Offer state machine.
-5. GiftMatcher.
-6. DIRECT_SALE.
-7. PATRON.
-8. asset/series reservation.
-9. crash-safe paid fulfillment.
-10. duplicate-Gift protection.
+1. Persist normalized GiftEvent/GiftLedger state.
+2. GiftEvent-based sender/value attribution.
+3. Pending gift expectation per conversation/chat where needed.
+4. MANUAL_REVIEW + durable Control Bot CONFIRM/REJECT.
+5. Duplicate-Gift/profit idempotency.
+6. Keep Stars ledger for audit/diagnostics only; no mandatory reconciliation matcher.
+7. Offer state machine.
+8. DIRECT_SALE.
+9. PATRON.
+10. asset/series reservation.
+11. crash-safe paid fulfillment.
 
 ---
 
@@ -1006,9 +1027,14 @@ repeated worker crashes -> ERROR/STOPPED, no infinite restart
 Supervisor restart does not invalidate active durable admin callback
 Vault reindex works through user-account worker
 media resend has no forward attribution
-anonymous Gift remains UNMATCHED
-Gift reconciliation is idempotent
-one Gift pays at most one Offer
+duplicate Gift credits profit once
+Gift from current DM user auto-confirms
+Gift from expected sender auto-confirms and fulfills expectation
+sender mismatch / unknown sender -> MANUAL_REVIEW
+nameHidden with known sender remains attributable
+manual CONFIRM credits known profit once and clears expectation
+manual REJECT credits nothing and keeps expectation
+one confirmed Gift pays at most one Offer
 anon -> DM preserves conversation_id
 raw feed pruning cannot delete canonical history
 Supervisor does not write creator.db
@@ -1056,8 +1082,10 @@ DeepSeek читает protected code для контекста
 - AI/HUMAN/HYBRID работает со stale cancellation;
 - Media Vault индексируется user-account worker-ом;
 - media tags deterministic/manual;
-- Gifts проходят code-side matching/reconciliation;
-- ambiguous Gifts не оплачивают Offer;
+- Gifts подтверждаются code-side по authoritative live GiftEvent;
+- sender match с current conversation/expectation auto-confirms Gift;
+- unknown/mismatched/ambiguous Gift идёт в MANUAL_REVIEW и не оплачивает Offer автоматически;
+- Stars history остаётся audit/ledger infrastructure, а не mandatory Gift reconciliation;
 - paid fulfillment crash-safe;
 - Control Bot callbacks durable;
 - runtime auth не блокируется на stdin;
