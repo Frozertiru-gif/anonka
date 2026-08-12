@@ -1,303 +1,472 @@
 # Anonka — целевая архитектура
 
-> Статус: каноническая архитектурная спецификация проекта после перехода на Teleton Agent как инфраструктурную базу.  
+> Статус: каноническая архитектурная спецификация проекта после аудита фактической кодовой базы Teleton Agent.  
 > Репозиторий: `Frozertiru-gif/anonka`.  
-> Цель документа: зафиксировать границы системы и согласованные решения так, чтобы Codex реализовывал их поэтапно, не придумывая архитектуру заново.
+> Цель документа: зафиксировать, что мы реально переиспользуем из Teleton, что меняем, что удаляем и какую доменную архитектуру строим поверх готовой инфраструктуры.
 
 ---
 
 ## 1. Что строим
 
-`anonka` — постоянно работающая Telegram-система под отдельным пользовательским аккаунтом, которая:
+`anonka` — Telegram-платформа для одного или нескольких реальных creator-аккаунтов, где AI может вести переписки от имени конкретного creator, а сам creator в любой момент может вмешаться вручную.
 
-1. работает через MTProto как реальный Telegram user-account;
-2. ведет разговоры через один или несколько настраиваемых анонимных chat-каналов;
-3. параллельно ведет обычные DM;
-4. сохраняет один логический conversation при переходе anon → DM;
-5. использует одну фиксированную девушку/персону, но допускает разные behavioral/model profiles для разных каналов;
-6. генерирует в runtime в основном текст, а фото/видео/video notes берет из заранее подготовленного Media Vault;
+Ключевая модель системы:
+
+```text
+Creator
+├── свой Telegram user-account
+├── своя persona / стиль общения
+├── свой Media Vault
+├── свои conversation
+├── свой anon source/controller
+└── свой runtime state
+```
+
+Система:
+
+1. работает через MTProto как реальные Telegram user-account;
+2. умеет работать с anonymous-chat bot и обычными DM;
+3. сохраняет один логический `conversation` при переходе anon → DM;
+4. поддерживает режимы `AI | HUMAN | HYBRID` на каждый conversation;
+5. генерирует в runtime в основном текст;
+6. берет фото/видео/video notes из заранее подготовленного и промодерированного Media Vault;
 7. поддерживает `DIRECT_SALE` и `PATRON`;
-8. проверяет Gifts/Stars только кодом;
+8. подтверждает Gifts/Stars только кодом;
 9. управляется через отдельного приватного Telegram control-bot;
-10. позволяет назначать разные LLM-модели на разные каналы и задачи без изменения Telegram/DB/media-логики.
+10. использует общую LLM-конфигурацию для всех CreatorRuntime, если явно не появится необходимость в override позже.
 
-Система не должна быть general-purpose autonomous agent. Teleton используется как инфраструктурный chassis, а не как готовый decision engine.
+Система **не является general-purpose autonomous agent**. Teleton используется как инфраструктурный chassis, а не как готовый decision engine.
 
 ---
+
+# ЧАСТЬ A — ЧТО БЕРЕМ ИЗ TELETON
 
 ## 2. База проекта: Teleton Agent
 
-Текущий импортированный baseline: Teleton Agent 0.10.1, TypeScript/Node.js, GramJS/MTProto.
+Импортированный baseline уже содержит значительную часть нужной инфраструктуры. Ее не нужно переписывать с нуля.
 
-### Из Teleton сохраняем
+### 2.1. Сохраняем практически как есть
 
-- MTProto user-account session/auth;
-- Telegram bridge;
-- получение и отправку DM;
-- message queue;
-- dedupe;
-- typing primitives;
-- rate-limit/FloodWait/retry primitives;
-- SQLite/WAL foundation;
-- media send/download primitives;
-- LLM provider adapters/OpenAI-compatible infrastructure;
-- usage/latency instrumentation, где оно уже есть;
-- low-level Stars/Gifts helpers после проверки реальным Gift fixture.
+#### Telegram user-account infrastructure
 
-### Не используем как ядро Anonka
-
-- автономный `AgentRuntime` с циклом `LLM → tool → LLM → tool`;
-- универсальный tool registry как способ управлять Telegram;
-- произвольные LLM-accessible Telegram tools;
-- TON/DEX/DNS/NFT/DeFi/wallet функциональность;
-- MCP как обязательную часть runtime;
-- coding/general assistant функции;
-- глобальную память Teleton для персональных фактов о разных собеседниках;
-- WebUI как основной control plane.
-
-### Главная замена
-
-Вместо agent loop:
+Сохраняем и переиспользуем:
 
 ```text
-Telegram Event
-→ EventRouter
+src/telegram/client.ts
+src/telegram/bridges/user.ts
+src/telegram/bridge-interface.ts
+src/telegram/flood-retry.ts
+src/telegram/offset-store.ts
+src/telegram/debounce.ts
+```
+
+Из `src/telegram/handlers.ts` сохраняем инфраструктурную часть:
+
+- `ChatQueue`;
+- per-chat serial processing;
+- global concurrency limit;
+- dedupe;
+- persistent offset;
+- rate limit;
+- typing simulation primitives;
+- сохранение incoming до обработки;
+- graceful drain/recovery behavior.
+
+#### SQLite foundation
+
+Сохраняем:
+
+- `better-sqlite3`;
+- WAL;
+- foreign keys;
+- migrations;
+- текущий database lifecycle;
+- существующие полезные stores там, где они не конфликтуют с новой доменной моделью.
+
+Новый отдельный `DatabaseService` не нужен.
+
+#### LLM provider layer
+
+Сохраняем существующий provider/model layer Teleton:
+
+```text
+src/providers/
+src/agent/client.ts
+src/agent/model-request.ts
+src/agent/provider-fallback.ts
+```
+
+Он уже решает:
+
+- выбор provider/model;
+- OpenAI-compatible endpoints;
+- local model servers;
+- timeout;
+- AbortSignal;
+- temperature/max tokens;
+- provider fallback на технических ошибках;
+- stripping reasoning blocks там, где это требуется;
+- usage/provider plumbing.
+
+Мы не пишем новый универсальный `LLMProvider` с нуля.
+
+#### Telegram Bot API infrastructure
+
+Сохраняем существующий bot-layer:
+
+```text
+src/telegram/bridges/bot.ts
+src/bot/callback-router.ts
+src/bot/callback-answer.ts
+src/bot/rate-limiter.ts
+```
+
+Control Bot строится **на этой инфраструктуре**, а не отдельной новой библиотекой.
+
+#### Gifts / service messages
+
+Teleton уже разбирает MTProto service events:
+
+```text
+MessageActionStarGift
+MessageActionStarGiftPurchaseOffer
+MessageActionStarGiftPurchaseOfferDeclined
+```
+
+Этот low-level parsing сохраняем и превращаем в typed domain events.
+
+---
+
+## 3. Что из Teleton переделываем
+
+### 3.1. `MessageHandler`
+
+Не удаляем целиком.
+
+Было:
+
+```text
+Telegram message
+→ AgentRuntime.processMessage()
+→ LLM tools
+→ response
+```
+
+Станет:
+
+```text
+Telegram message
+→ TransportRouter
 → ConversationService
 → ContextBuilder
-→ ModelRouter / LLMService
+→ AnonkaLLMService
 → ChatDecision
 → DecisionValidator
 → ActionCoordinator
-→ Telegram / Media / Offer / Handoff actions
 ```
 
-LLM принимает смысловые решения. Код выполняет реальные действия.
+Инфраструктурная очередь и persistence остаются, decision engine заменяется.
+
+### 3.2. Bot filter
+
+Исходный Teleton игнорирует `message.isBot`.
+
+Для Anonka:
+
+```text
+sender is bot?
+├── exact configured anonymous bot → AnonAdapter
+└── любой другой bot → ignore
+```
+
+Нельзя включать общий режим «принимать всех ботов».
+
+### 3.3. Outgoing from self
+
+Исходный Teleton игнорирует сообщения от собственного user-account.
+
+В Anonka manual outgoing от creator является важным событием:
+
+```text
+manual outgoing
+→ persist source=creator_manual
+→ invalidate stale AI job
+→ применить AI/HUMAN/HYBRID policy
+```
+
+Программные outgoing должны коррелироваться с outbox/message id и не считаться ручным вмешательством.
+
+### 3.4. Gifts
+
+Сейчас Teleton может представлять Gift event как текст для AgentRuntime.
+
+В Anonka:
+
+```text
+MTProto service event
+→ GiftEventParser
+→ typed GiftEvent
+→ GiftService
+→ OfferMatcher
+```
+
+Gift не отправляется LLM как инструкция и LLM не подтверждает оплату.
+
+### 3.5. Persona/Soul
+
+Сохраняем концепцию стабильных prompt blocks и файлов вроде `SOUL.md`, но полностью меняем содержимое.
+
+Для каждого CreatorRuntime:
+
+```text
+SOUL.md      → persona и стиль creator
+STRATEGY.md  → стратегия общения/коммерческая политика
+SECURITY.md  → системные ограничения runtime
+```
+
+Глобальные `MEMORY.md`, `USER.md`, daily memory Teleton нельзя использовать как память разных клиентов.
+
+### 3.6. Memory compaction
+
+Алгоритмическую основу compaction/summarization можно переиспользовать.
+
+Переписываем summary prompt под conversation:
+
+```text
+Facts about person
+Relationship/context summary
+Important previous events
+Open conversation threads
+Recent messages
+```
+
+Не сохраняем TON/tool-agent semantics.
 
 ---
 
-## 3. Главный архитектурный принцип
+## 4. Что удаляем после переключения production path
 
-> **LLM отвечает за язык, смысл, характер и семантические намерения. Код отвечает за состояние, деньги, Telegram actions и проверяемые факты.**
+Удаление выполняется **после** того, как новый runtime покрыт тестами/spike.
 
-### LLM может
-
-- написать ответ;
-- вернуть `no_reply`;
-- выделить новые facts о собеседнике;
-- сформировать `MediaIntent`;
-- сформировать `OfferIntent`;
-- предложить мягкий gift ask в `PATRON`;
-- предложить handoff anon → DM;
-- учитывать подтвержденные кодом события.
-
-### LLM не может
-
-- сама отправлять `next/search/stop/link`;
-- считать Gift полученным;
-- выбирать конкретный `media_asset_id`;
-- помечать Offer как paid;
-- выполнять fulfillment;
-- менять runtime config;
-- переключать модель/канал;
-- читать чужие dialogs/contacts;
-- выполнять произвольные Telegram tools.
-
-Запрещенные поля/команды в LLM output:
+### Полностью удалить
 
 ```text
-next_room
-search_room
-stop_room
-payment_success
-selected_media_id
-gift_received
-end_conversation
-set_model
-set_price
+TON / wallet / DEX / NFT / DNS / DeFi
+Gocoon
+MCP runtime
+Agent tool registry
+Agent autonomous loop
+Tool RAG
+general-purpose Telegram tools exposed to LLM
+coding/general-agent capabilities
+plugin marketplace / plugin hot reload
+WebUI
+Management API, пока он не нужен продукту
+heartbeat autonomous tasks
+scheduled autonomous agent tasks
+RVC docker layer
+vector embeddings / sqlite-vec для обычной переписки
 ```
+
+### Из `src/agent/` сначала вынести полезное
+
+Перед удалением generic agent layer сохранить/переместить в нейтральный `src/llm/`:
+
+```text
+client.ts
+model-request.ts
+provider-fallback.ts
+нужные token usage helpers
+provider/schema compatibility helpers
+```
+
+После этого удаляется `AgentRuntime`, tool loop и связанная general-agent инфраструктура.
 
 ---
 
-## 4. Telegram topology
+# ЧАСТЬ B — RUNTIME TOPOLOGY
 
-Система использует несколько типов Telegram сущностей.
+## 5. Главная архитектурная единица — Creator
+
+Вместо прежнего центрального `Channel` вводится `CreatorProfile`.
 
 ```text
-                         OWNER
-                           │
-                  Telegram Control Bot
-                           │
-                     AdminCommandBus
-                           │
-                           ▼
-                    ANONKA RUNTIME
-                           │
-      ┌────────────────────┼────────────────────┐
-      │                    │                    │
- User Account/MTProto   Service chats       LLM Providers
-      │                    │                    │
-      │                    ├─ Media Vault       ├─ local
-      │                    └─ Ops Log(optional) ├─ remote A
-      │                                         └─ remote B
-      │
-      ├─ Anonymous bot/channel A
-      ├─ Anonymous bot/channel B ...
-      └─ Real Telegram DMs
+CreatorProfile
+├── id
+├── display_name
+├── enabled
+├── telegram account/session config
+├── persona config
+├── media_vault_chat_id
+├── commercial_policy
+├── default_offer_price_stars
+└── anon source config
 ```
 
-### 4.1. User-account
+Слово `model` в доменной архитектуре не используется для обозначения creator-девушки, чтобы не путать ее с LLM model.
 
-Отдельный Telegram user-account — рабочий транспорт. Через него система:
-
-- общается с anonymous bots;
-- отвечает в DM;
-- отправляет media;
-- получает Gifts/Stars события;
-- получает ручные outgoing владельца, если владелец вмешался в конкретный DM.
-
-### 4.2. Control bot
-
-Отдельный обычный Telegram Bot API bot — **единственный основной интерфейс управления**.
-
-Saved Messages больше не является главным admin UI. Его можно оставить как аварийный fallback позже, но архитектура не зависит от него.
-
-### 4.3. Media Vault
-
-Приватный Telegram channel/chat с заранее загруженным контентом и семантическими tags.
-
-### 4.4. Ops Log
-
-Опциональный приватный Telegram channel для append-only технического журнала/важных событий. Он не является source of truth: source of truth — SQLite. Критические alerts также идут владельцу через Control Bot.
+В коде используем термин `creator`.
 
 ---
 
-# ЧАСТЬ A — CHANNELS
+## 6. CreatorRuntime
 
-## 5. Что такое Channel в Anonka
-
-`Channel` — это **логический рабочий поток/источник трафика**, а не обязательно Telegram broadcast-channel.
-
-Например:
+Один `CreatorRuntime` обслуживает **один Telegram user-account**.
 
 ```text
-ru_anon_main
-tr_anon_test
-en_anon_test
-```
-
-Каждый Channel имеет собственные настройки:
-
-```text
-id
-enabled
-transport_type = anon
-anon_peer_id / anon_bot_username
-language
-persona_profile_id
-behavior_profile_id
-model_profile_id
-media_pool_id
-commercial_mode
-offer_price_stars
-idle_timeout_seconds
-search_watchdog_seconds
-max_parallel_rooms
-```
-
-На первом этапе `max_parallel_rooms=1` для одного конкретного anonymous bot channel.
-
-### Зачем Channel abstraction
-
-Чтобы без копирования кода можно было:
-
-- подключать другой anonymous bot;
-- тестировать другой язык/рынок;
-- назначить другой LLM;
-- менять коммерческую стратегию;
-- менять цену;
-- использовать отдельный media pool;
-- включать/выключать канал через Telegram control-bot;
-- сравнивать метрики по каналам.
-
----
-
-## 6. ChannelRuntime
-
-Каждый enabled anon Channel имеет свой `ChannelRuntime`:
-
-```text
-ChannelRuntime
-├── ChannelConfig
-├── AnonAdapter
+CreatorRuntime
+├── CreatorProfile
+├── GramJS user bridge
+├── Telegram session
+├── ConversationService
 ├── AnonController
-├── channel lock
-├── room_generation
-├── watchdog
-├── metrics
-└── current conversation reference
+├── Media Vault binding
+├── Gift event pipeline
+├── creator-specific persona
+└── runtime state
 ```
 
-Контроллеры разных Channel не должны делить room state.
+### Почему не один огромный multi-account `TeletonApp`
 
-Одновременно допускается:
+Текущий Teleton сильно singleton-oriented:
 
 ```text
-Channel ru_anon_main → room #101
-Channel tr_anon_test → room #55
-DM peer A
-DM peer B
-DM peer C
+1 TeletonApp
+1 bridge
+1 TELETON_HOME
+1 memory.db
+1 session/workspace
 ```
 
-при условии, что Telegram transport и конкретные anonymous bots технически позволяют параллельную работу.
+Ломать это ради нескольких user-account невыгодно.
+
+Поэтому масштабирование строится через изолированные runtime:
+
+```text
+/data/creators/alina
+/data/creators/masha
+/data/creators/vika
+```
+
+или эквивалентные отдельные `TELETON_HOME`/runtime directories.
+
+Каждый runtime имеет собственные:
+
+- Telegram session;
+- SQLite data/runtime state;
+- persona files;
+- media binding;
+- conversations;
+- anon state.
 
 ---
 
-## 7. Origin channel
+## 7. CreatorSupervisor
 
-Каждая conversation хранит:
+Над CreatorRuntime находится общий supervisor:
 
 ```text
-origin_channel_id
-current_transport = anon | dm
-telegram_peer_id NULL until DM
+CreatorSupervisor
+├── start creator runtime
+├── stop creator runtime
+├── restart creator runtime
+├── health/status
+├── route admin commands
+└── aggregate alerts/metrics
 ```
 
-После handoff в DM `origin_channel_id` **не меняется**.
+Control Bot общается с Supervisor, а не напрямую с внутренним Telegram handler конкретного creator.
 
-Это нужно для:
+### MVP
 
-- аналитики;
-- выбора языка/persona/model defaults;
-- attribution;
-- сравнения conversion по каналам;
-- сохранения behavior/model policy после handoff.
+На первом этапе допускается один creator runtime.
 
-Прямой DM без handoff получает `origin_channel_id = direct_dm`.
+Архитектура при этом сразу должна позволять:
+
+```text
+Creator #1 runtime
+Creator #2 runtime
+Creator #3 runtime
+```
+
+без смешивания sessions/conversations/media.
 
 ---
 
-## 8. Anon bot exception в Teleton
+## 8. Общая LLM-конфигурация
 
-Исходный Teleton может игнорировать сообщения от bots через `message.isBot`.
-
-Нужно заменить глобальный запрет на allowlist:
+По умолчанию все CreatorRuntime используют одну общую LLM-конфигурацию.
 
 ```text
-if sender is bot:
-    if peer_id in configured_anon_bot_peers:
-        route_to_anon_adapter()
-    else:
-        ignore()
+GlobalLLMConfig
+├── provider
+├── model
+├── utility_model
+├── api/base_url
+├── temperature
+├── max_tokens
+└── technical fallbacks
 ```
 
-Никакой общий режим «принимать всех ботов» не нужен.
+Creator-specific LLM override **не нужен для MVP**.
+
+Если позже появится реальная причина использовать разную LLM для разных creator, добавляется optional override без изменения conversation core.
+
+Не создавать сейчас:
+
+```text
+Channel.model_profile_id
+conversation.model_profile_id
+ModelProfile table
+ModelRouter per channel
+```
 
 ---
 
-## 9. Anon state machine
+## 9. Control Bot работает параллельно user runtimes
 
-Для каждого Channel отдельно:
+У Teleton основной bridge сейчас выбирается как `user OR bot`.
+
+Anonka требует:
+
+```text
+CreatorRuntime(s) → user-account bridge(s)
+Control Plane     → отдельный bot bridge
+```
+
+Поэтому bot runtime wiring отделяется от creator user bridge.
+
+Существующий `GrammyBotBridge` переиспользуется как база Control Bot.
+
+---
+
+# ЧАСТЬ C — ANON SOURCE
+
+## 10. AnonSource вместо Channel
+
+Если creator работает через anonymous-chat bot, у него есть `AnonSource`.
+
+```text
+AnonSource
+├── id
+├── creator_id
+├── enabled
+├── bot_peer_id / username
+├── adapter_type
+├── language
+├── idle_timeout_seconds
+└── search_watchdog_seconds
+```
+
+`AnonSource` — узкая transport-конфигурация, а не центральная бизнес-сущность.
+
+Если позже одному creator понадобится несколько anonymous bots, `AnonSource` становится массивом/отдельной таблицей без изменения остальных доменов.
+
+---
+
+## 11. AnonController
+
+На каждый активный AnonSource:
 
 ```text
 STOPPED
@@ -312,7 +481,7 @@ STOPPED
   │ start
   ▼
 SEARCHING
-  │ room_ready OR first_partner_message
+  │ room_ready / first_partner_message
   ▼
 ROOM_ACTIVE
   │
@@ -326,13 +495,19 @@ ROOM_ACTIVE
   └── admin stop ─────────────► STOPPED
 ```
 
-`ENDED` относится к archived conversation, а не к Channel controller.
-
 ---
 
-## 10. AnonAdapter
+## 12. AnonAdapter
 
-Конкретную механику каждого anonymous bot инкапсулирует adapter.
+```ts
+interface AnonAdapter {
+  search(): Promise<void>;
+  next(): Promise<void>;
+  stop(): Promise<void>;
+  requestLink(): Promise<void>;
+  reconcile(): Promise<ObservedAnonState>;
+}
+```
 
 Нормализованные события:
 
@@ -347,60 +522,60 @@ LINK_REQUEST_CONFIRMED
 UNKNOWN_SERVICE_EVENT
 ```
 
-Интерфейс:
+Adapter может работать через:
 
-```ts
-interface AnonAdapter {
-  search(): Promise<void>;
-  next(): Promise<void>;
-  stop(): Promise<void>;
-  requestLink(): Promise<void>;
-  reconcile(): Promise<ObservedAnonState>;
-}
-```
+- text commands;
+- reply keyboard;
+- inline buttons;
+- edited messages;
+- raw MTProto updates.
 
-Adapter может использовать текстовые команды, reply keyboard, inline buttons, edited messages или raw MTProto updates.
-
-Перед production для каждого нового anon bot нужен protocol reconnaissance.
+Перед production нужен reconnaissance конкретного anonymous bot.
 
 ---
 
-## 11. Stale generation protection
+## 13. Stale generation protection
 
-У каждого Channel монотонный `room_generation`.
+У AnonController есть монотонный `room_generation`.
 
 Каждый LLM job хранит snapshot:
 
 ```text
-channel_id
+creator_id
 conversation_id
+anon_source_id
 room_generation
 conversation_version
 ```
 
-Перед send:
+Перед side effect:
 
 ```text
 if snapshot != current state:
     drop result
 ```
 
-Generation инвалидируется **до** next/stop/confirmed handoff.
+Generation инвалидируется **до** `next`, `stop` и confirmed handoff.
 
 ---
 
-# ЧАСТЬ B — CONVERSATIONS И HANDOFF
+# ЧАСТЬ D — CONVERSATIONS
 
-## 12. Conversation = один человек
+## 14. Conversation = один человек
 
-Conversation привязан к человеку, а не к Telegram transport.
+Conversation не равен Telegram chat id.
+
+Это критично для anonymous chat: физический Telegram chat с anonymous bot один и тот же, а люди в комнатах разные.
+
+Нужен собственный `conversation_id`.
 
 До handoff:
 
 ```text
 conversation_id=184
-origin_channel_id=ru_anon_main
+creator_id=alina
 current_transport=anon
+anon_source_id=anon_ru
 telegram_peer_id=NULL
 ```
 
@@ -408,62 +583,93 @@ telegram_peer_id=NULL
 
 ```text
 conversation_id=184
-origin_channel_id=ru_anon_main
+creator_id=alina
 current_transport=dm
 telegram_peer_id=123456789
 ```
 
-Сохраняются:
-
-- history;
-- facts;
-- summary;
-- persona/behavior snapshots;
-- model profile;
-- sent media;
-- active Offer;
-- commercial mode;
-- adult eligibility state;
-- attribution к Channel.
+Прямой DM создает новый conversation для конкретного creator.
 
 ---
 
-## 13. Параллельность DM
+## 15. Conversation data
 
-Разные DM работают параллельно, но каждый conversation последовательно.
-
-На conversation:
+Conversation хранит:
 
 ```text
-history
-facts
-summary
-debounce
-lock
+creator_id
+current_transport
+telegram_peer_id
+anon_source_id
+state
+control_mode
 version
-pending LLM job
+facts
+rolling summary
+recent messages
+sent media
 active Offer
-sent media set
-manual override
+commercial mode
 last activity
 ```
 
-Контексты разных людей никогда не смешиваются.
+Контексты разных людей и разных creator никогда не смешиваются.
 
 ---
 
-## 14. Handoff anon → DM
+## 16. Control mode
 
-LLM может вернуть только:
+На каждый conversation:
+
+```text
+AI
+HUMAN
+HYBRID
+```
+
+### AI
+
+AI отвечает автоматически.
+
+### HUMAN
+
+Creator ведет conversation вручную. AI не отправляет сообщения.
+
+### HYBRID
+
+AI продолжает вести conversation, но creator может вручную вмешиваться. Ручные сообщения сохраняются в общей истории и учитываются AI дальше.
+
+---
+
+## 17. Manual creator outgoing
+
+При ручном сообщении creator:
+
+```text
+persist source=creator_manual
+→ increment conversation_version
+→ cancel/invalidate pending AI generation
+→ apply control-mode policy
+```
+
+Не использовать фиксированный `MANUAL_OVERRIDE=60s` как основную модель управления.
+
+Явный `control_mode` является source of truth.
+
+---
+
+## 18. Handoff anon → DM
+
+LLM может вернуть только semantic intent:
 
 ```json
 {"handoff_intent":"offer"}
 ```
 
-Код:
+Код выполняет:
 
 ```text
-requestLink()
+AnonAdapter.requestLink()
 → HANDOFF_PENDING
 → create handoff record
 → wait for reliable DM correlation
@@ -471,7 +677,7 @@ requestLink()
 
 Порядок matching:
 
-1. token/prefilled marker, если anon flow позволяет;
+1. token/prefilled marker, если protocol позволяет;
 2. другой уникальный технический признак;
 3. temporal correlation только если она однозначна.
 
@@ -479,223 +685,153 @@ requestLink()
 
 После confirmed handoff:
 
-1. bind `telegram_peer_id`;
-2. switch `current_transport=dm`;
-3. сохранить ту же conversation;
-4. invalidate anon generation;
-5. освободить Channel room;
-6. Channel начинает следующий search;
-7. DM продолжает независимо.
-
----
-
-## 15. Manual owner intervention
-
-Если владелец пишет вручную с user-account в конкретный DM:
-
 ```text
-save source=manual
-invalidate conflicting AI job
-set MANUAL_OVERRIDE
+bind telegram_peer_id
+switch transport → dm
+keep same conversation_id
+invalidate anon generation
+release anon room
+start next search
+DM continues independently
 ```
 
-Программные outgoing должны коррелироваться с outbox/message id и не активировать manual override.
+---
 
-Control Bot не считается сообщением conversation.
+# ЧАСТЬ E — LLM И DECISION ENGINE
+
+## 19. Главный принцип
+
+> **LLM отвечает за язык, смысл, persona и семантические намерения. Код отвечает за состояние, Telegram actions, media, деньги и проверяемые факты.**
+
+### LLM может
+
+- написать ответ;
+- вернуть `no_reply`;
+- выделить новые facts о собеседнике;
+- сформировать `MediaIntent`;
+- сформировать `OfferIntent`;
+- предложить мягкий gift ask в `PATRON`;
+- предложить handoff anon → DM;
+- рекомендовать human attention;
+- учитывать подтвержденные кодом события.
+
+### LLM не может
+
+- сама отправлять `next/search/stop/link`;
+- считать Gift полученным;
+- выбирать конкретный `media_asset_id`;
+- помечать Offer как paid;
+- выполнять fulfillment;
+- менять runtime config;
+- читать произвольные Telegram dialogs/contacts;
+- выполнять arbitrary Telegram tools.
 
 ---
 
-# ЧАСТЬ C — MODEL ROUTER И РАЗНЫЕ МОДЕЛИ
+## 20. AnonkaLLMService
 
-## 16. Модели не хардкодятся
+Не создаем новый provider stack.
 
-Никакого `DeepSeek`/`Qwen`/другого имени модели в conversation core.
+```text
+ContextBuilder
+→ AnonkaLLMService
+→ existing Teleton/pi-ai provider layer
+→ normalized ChatDecision
+```
 
-Базовый provider contract:
+Используем существующие provider/model resolver, timeout, fallback и request plumbing.
+
+Fallback разрешен только для технических ошибок:
+
+- timeout;
+- transient 5xx;
+- connection error;
+- rate limit;
+- local endpoint unavailable.
+
+---
+
+## 21. ChatDecision
 
 ```ts
-interface LLMProvider {
-  generate(request: LLMRequest): Promise<LLMRawResponse>;
-}
+type ChatDecision = {
+  response_mode: "reply" | "no_reply";
+  text?: string;
+  learned_facts: FactUpdate[];
+  media_intent?: MediaIntent;
+  offer_intent?: OfferIntent;
+  soft_gift_ask: boolean;
+  handoff_intent: "none" | "offer";
+  human_attention?: {
+    recommended: boolean;
+    reason?: string;
+  };
+};
 ```
 
-Провайдеры/endpoint/model задаются конфигом.
-
-Пример:
-
-```text
-provider=openai_compatible
-base_url=http://127.0.0.1:1234/v1
-api_key=...
-model=...
-```
-
-или remote endpoint с тем же contract.
+Fact extraction по возможности выполняется в основном chat call, а не отдельным LLM request на каждое сообщение.
 
 ---
 
-## 17. ModelProfile
-
-`ModelProfile` описывает набор моделей **по задачам**.
+## 22. Structured output strategy
 
 ```text
-model_profile: chat_local
-
-chat:
-  provider: local
-  model: qwen-...
-  temperature: 0.9
-  max_output_tokens: 160
-  reasoning: off
-
-summary:
-  provider: local
-  model: qwen-...
-  temperature: 0.2
-  max_output_tokens: 500
-
-repair:
-  provider: local
-  model: qwen-...
-  temperature: 0.1
-  max_output_tokens: 250
-
-fallback_chat:
-  provider: remote_optional
-  model: ...
-```
-
-`chat`, `summary`, `repair` могут указывать как на одну модель, так и на разные.
-
-LATER можно добавить:
-
-```text
-vision
-stt
-translation
-```
-
-не меняя conversation core.
-
----
-
-## 18. Модель на Channel
-
-Каждый Channel имеет `model_profile_id`.
-
-Пример:
-
-```text
-ru_anon_main → model_profile=local_fast_ru
-tr_anon_test → model_profile=remote_multilingual
-```
-
-Conversation при создании получает snapshot default model profile:
-
-```text
-conversation.model_profile_id
-```
-
-После handoff в DM он сохраняется.
-
-Admin может:
-
-- изменить default модели для новых conversations данного Channel;
-- явно переключить конкретную conversation;
-- при необходимости применить новый profile ко всем активным conversations осознанной командой.
-
-Никаких неявных смен модели посреди разговора.
-
----
-
-## 19. ModelRouter
-
-```text
-LLM task
-→ resolve conversation/channel
-→ resolve ModelProfile
-→ choose task model
-→ capability check
-→ provider call
-→ normalized result
-```
-
-Модель выбирается по:
-
-1. `conversation.model_profile_id`;
-2. task (`chat|summary|repair|...`);
-3. provider health;
-4. capability requirements.
-
----
-
-## 20. Capability profile провайдера
-
-Для каждого provider/model фиксировать:
-
-```text
-supports_json_schema
-supports_json_object
-supports_reasoning_toggle
-supports_usage
-supports_cached_tokens
-supports_streaming
-```
-
-Structured output strategy:
-
-```text
-native JSON Schema
+native JSON/schema support if provider supports it
 → JSON object mode
-→ plain text JSON + validation
-→ one repair
+→ plain JSON + validation
+→ one repair attempt
 → safe text-only fallback
 ```
 
-Если output невалиден, никакие media/payment/system actions не выполняются.
+При невалидном structured output:
+
+- текст можно отправить только через безопасный fallback;
+- media/offer/handoff/system actions не выполняются.
 
 ---
 
-## 21. Fallback policy
+## 23. Prompt assembly
 
-Fallback разрешен только при технической проблеме:
-
-- timeout;
-- transient provider 5xx;
-- connection error;
-- rate limit;
-- недоступность локального сервера.
-
-Fallback **не используется для обхода safety refusal/политик провайдера**.
-
-Все fallback events логируются.
-
----
-
-## 22. Generation defaults
-
-Для обычного Telegram/RP диалога baseline:
+Порядок:
 
 ```text
-temperature ≈ 0.9
-thinking/reasoning = off
+1. SYSTEM CORE
+2. CREATOR PERSONA / SOUL
+3. CREATOR BEHAVIOR / STRATEGY
+4. FEW-SHOT STYLE EXAMPLES
+5. RUNTIME CONTEXT
+6. KNOWN FACTS ABOUT CUSTOMER
+7. ROLLING SUMMARY
+8. RECENT MESSAGES
+9. CURRENT BATCH
+```
+
+Стабильные блоки идут первыми для prefix caching.
+
+---
+
+## 24. Generation defaults
+
+Для обычного Telegram dialogue baseline:
+
+```text
+temperature ≈ 0.8–1.0
+reasoning/thinking = off
 короткий output
 ```
 
-Точные значения принадлежат ModelProfile, а не hardcoded core.
+Точные значения задаются global LLM config.
 
-Логировать на каждый LLM call:
+Логировать:
 
 ```text
+creator_id
+conversation_id
 provider
 model
-model_profile_id
 task
-channel_id
-conversation_id
 prompt_version
 persona_version
-behavior_policy_version
 temperature
 latency_ms
 input_tokens
@@ -706,86 +842,18 @@ fallback_used
 
 ---
 
-# ЧАСТЬ D — CONTEXT, PERSONA, MEMORY
+# ЧАСТЬ F — MEMORY И CONCURRENCY
 
-## 23. Одна фиксированная персона
+## 25. Память
 
-Персона отделена от модели.
+Для каждого conversation:
 
-```text
-Persona != ModelProfile != BehaviorProfile
-```
+### Structured facts
 
-Persona содержит:
-
-- постоянное имя/возраст/биографию;
-- характер;
-- Telegram texting style;
-- типичную длину сообщений;
-- сленг/мат/эмодзи;
-- инициативность;
-- few-shot examples;
-- запрет assistant-style канцелярита.
-
-Разные Channel могут использовать разные localization/behavior overlays, не создавая новую девушку.
-
----
-
-## 24. Prompt assembly
-
-Порядок:
-
-```text
-1. SYSTEM CORE
-2. PERSONA
-3. CHANNEL POLICY / LANGUAGE
-4. BEHAVIOR PROFILE
-5. FEW-SHOT EXAMPLES
-6. RUNTIME CONTEXT
-7. KNOWN FACTS ABOUT USER
-8. ROLLING SUMMARY
-9. RECENT MESSAGES
-10. CURRENT BATCH
-```
-
-Стабильные блоки первыми для prefix caching.
-
----
-
-## 25. ChatDecision
-
-Нормализованный output:
-
-```ts
-type ChatDecision = {
-  response_mode: "reply" | "no_reply";
-  text?: string;
-  learned_facts: FactUpdate[];
-  media_intent?: MediaIntent;
-  offer_intent?: MediaIntent;
-  soft_gift_ask: boolean;
-  handoff_intent: "none" | "offer";
-};
-```
-
-Fact extraction делается в основном chat call, а не отдельным запросом на каждое сообщение.
-
----
-
-## 26. Память
-
-Три уровня:
-
-### Global persona memory
-
-Только постоянные факты персонажа/политики. Не содержит персональные данные собеседников.
-
-### Per-conversation facts
+Например:
 
 ```text
 name
-age
-gender
 city
 work
 interests
@@ -793,326 +861,370 @@ preferences
 important events
 ```
 
-### Rolling summary + recent messages
+### Rolling summary
+
+Компактное состояние старой части разговора.
+
+### Recent messages
+
+Последняя часть диалога без summarization.
 
 Не отправлять всю историю с начала.
 
-Baseline:
-
-```text
-anon recent: ~20–30 messages
-dm recent:   ~30–50 messages
-summary when unsummarized >= 40 or context soft limit reached
-```
-
-Персональные facts никогда не хранятся в глобальной Teleton memory.
+Не использовать global Teleton user memory для клиентов.
 
 ---
 
-## 27. Debounce и concurrency
+## 26. Raw Telegram journal и domain conversation
+
+Существующий `tg_messages` можно сохранить как raw Telegram journal.
+
+Поверх него вводятся domain entities:
+
+```text
+conversations
+conversation_messages
+conversation_facts
+conversation_summaries
+```
+
+Это особенно важно для anonymous bot, где один Telegram `chat_id` содержит последовательность разных реальных собеседников.
+
+---
+
+## 27. Debounce
+
+Существующий `MessageDebouncer` переиспользуется, но wiring меняется.
 
 ```text
 incoming
-→ persist
-→ per-conversation debounce ~1.8s after last message
-→ build one batch
+→ persist raw event
+→ resolve conversation_id
+→ per-conversation debounce
+→ build one logical batch
 → one chat call
 ```
 
+Для DM debounce тоже должен работать, а не только для групп.
+
+---
+
+## 28. Concurrency
+
+Сохраняем идею существующего `ChatQueue`, но domain lock key должен быть `conversation_id`, а не только физический Telegram chat.
+
 MUST:
 
-- per-conversation lock;
-- per-Channel controller lock;
-- global LLM semaphore;
-- stale conversation version guard;
-- bounded retries;
-- graceful cancellation.
-
----
-
-# ЧАСТЬ E — TELEGRAM CONTROL BOT
-
-## 28. Control Bot — отдельный control plane
-
-Управление идет через отдельного Bot API бота.
-
-Требования:
-
 ```text
-CONTROL_BOT_TOKEN
-OWNER_TELEGRAM_ID
-```
-
-Принимать команды только если:
-
-```text
-chat is private
-AND from_user.id == OWNER_TELEGRAM_ID
-```
-
-Все остальные users получают отказ/игнор.
-
-Bot не ведет пользовательские conversations и не участвует в persona dialogue.
-
----
-
-## 29. Control Bot UI
-
-Основной UX — команды + inline keyboards.
-
-Главный экран `/status` показывает:
-
-```text
-runtime up/down
-Telegram user session status
-enabled Channels
-state каждого Channel
-active anon rooms
-active DMs
-LLM provider health
-model profile каждого Channel
-queue depth
-waiting/paid/blocked Offers
-last Gift
-last critical error
+per-conversation serial execution
+bounded global LLM concurrency
+conversation_version guard
+room_generation guard for anon
+AbortController for stale generation
+bounded retries
+graceful drain
 ```
 
 ---
 
-## 30. Команды Control Bot
+# ЧАСТЬ G — MEDIA VAULT
 
-Минимальный набор:
+## 29. Один Media Vault на creator
+
+У каждого creator свой private Telegram channel/chat.
 
 ```text
-/status
-
-/channels
-/channel <id>
-/channel_start <id>
-/channel_stop <id>
-/channel_next <id>
-
-/models
-/model <channel_id> <model_profile_id>
-/conversation_model <conversation_id> <model_profile_id>
-
-/mode <channel_id> direct|patron
-/price <channel_id> <stars>
-/offers <channel_id> on|off
-/media <channel_id> on|off
-
-/dm_pause <conversation_id>
-/dm_resume <conversation_id>
-
-/media_reindex
-/reload_prompts
-
-/errors
-/logs
-/panic
+Creator A → Media Vault A
+Creator B → Media Vault B
+Creator C → Media Vault C
 ```
 
-Inline buttons должны покрывать частые операции без ручного ввода id.
+Creator может самостоятельно загружать туда контент через обычный Telegram.
+
+AI-инструменты для разметки creator не нужны.
 
 ---
 
-## 31. Семантика admin operations
+## 30. Поддерживаемые media
 
-### `channel_stop`
-
-- прекращает новый search только данного Channel;
-- активные DM продолжаются;
-- другие Channel не затрагиваются.
-
-### `channel_next`
-
-- сначала invalidate `room_generation`;
-- затем controlled skip;
-- не затрагивает DM.
-
-### `model`
-
-- меняет default `model_profile_id` для **новых** conversations Channel;
-- активные conversations не переключаются автоматически.
-
-### `conversation_model`
-
-- явный override одной conversation;
-- invalidate pending LLM job;
-- следующий turn использует новый profile.
-
-### `price`
-
-- влияет только на новые Offers;
-- существующий Offer хранит snapshot цены.
-
-### `offers off`
-
-- запрещает новые Offers;
-- уже PAID fulfillment выполняется всегда.
-
-### `media off`
-
-- запрещает новые обычные media sends;
-- не блокирует уже оплаченный fulfillment.
-
-### `panic`
-
-Аварийный режим:
+MVP:
 
 ```text
-disable all anon search
-disable new AI replies
-disable new offers/media intents
-keep persistence/recovery/admin bot alive
-never undo already-confirmed payment state
+photo
+video
+video_note
 ```
 
-Выход из panic — только явной admin command.
+Для наборов фото/видео используем Telegram `media_group_id` и собственный `series_id`.
+
+Текущий Teleton media interface нужно расширить:
+
+```text
+video_note media type
+media_group_id
+sendVideo()
+sendVideoNote()
+```
+
+или единым domain-facing `sendMedia(asset)`.
 
 ---
 
-## 32. AdminCommandBus
+## 31. Strict manual tags
 
-Control Bot не изменяет состояние напрямую.
-
-```text
-Bot Update
-→ AdminAuth
-→ AdminCommandParser
-→ AdminCommandBus
-→ domain service
-→ SQLite transaction
-→ result
-→ Bot response
-```
-
-Это гарантирует, что те же операции можно потом вызывать из CLI/WebUI без дублирования business logic.
-
-Каждая admin mutation пишет `admin_audit_events`.
-
----
-
-## 33. Alerts через Control Bot
-
-Владелец получает push-события:
-
-```text
-channel watchdog failed
-Telegram session disconnected
-LLM provider unavailable/fallback activated
-repeated generation failures
-Gift received
-Offer paid
-fulfillment blocked
-Media Vault asset missing
-DB/recovery error
-adult eligibility violation blocked
-```
-
-Нельзя спамить каждым обычным сообщением/LLM call.
-
-Alert service должен иметь dedupe/rate limit.
-
----
-
-# ЧАСТЬ F — MEDIA VAULT
-
-## 34. Media Vault
-
-Canonical binary storage — private Telegram channel/chat.
-
-SQLite хранит индекс:
-
-```text
-source_chat_id
-source_message_id
-media_type
-access_class
-tags
-pool_id
-series
-description
-enabled
-missing
-use_count
-```
-
-Перед send source message refetch заново.
-
----
-
-## 35. Media pools
-
-Чтобы Channel могли использовать разные наборы контента, asset имеет `pool_id`.
+Caption содержит фиксированные tags из заранее известной схемы.
 
 Пример:
 
 ```text
-pool=default
-pool=ru_main
-pool=tr_test
-```
-
-Один физический Media Vault может содержать несколько pools.
-
-Не обязательно заводить отдельный Telegram channel на каждый pool.
-
----
-
-## 36. Семантическая разметка
-
-Пример caption:
-
-```text
-#anonka_media
-pool=default
-type=photo
-access=teaser
-content=selfie,cleavage
+#media
+access=casual
+content=face,full_body
 view=front
 outfit=shirt
-scene=home
-series=home_02
+scene=bedroom
+series=home_04
 ```
 
-MUST:
+Parser:
 
 ```text
-pool
-type=photo|video|video_note
-access=casual|teaser|paid
-content=<tags>
+known key
++
+known enum/value
 ```
 
-LLM никогда не получает полный каталог и не выбирает exact asset id.
+Неизвестный key/value → validation error.
+
+Creator не работает с prompt/context/temperature и не взаимодействует с LLM для разметки.
 
 ---
 
-## 37. MediaSelector
+## 32. Media moderation
+
+Новый asset не становится доступным AI сразу.
+
+```text
+Creator upload
+→ PENDING
+→ strict tag validation
+→ Control Bot moderation card
+├── APPROVE
+├── EDIT TAGS
+└── REJECT
+```
+
+Только `APPROVED` media входит в каталог, доступный `MediaSelector`.
+
+---
+
+## 33. Media schema
+
+Минимально:
+
+```text
+id
+creator_id
+source_chat_id
+source_message_id
+media_group_id NULL
+series_id NULL
+media_type
+access_class
+content_tags
+outfit_tags
+scene_tags
+view_tags
+description NULL
+moderation_status
+submitted_by
+approved_by NULL
+approved_at NULL
+enabled
+created_at
+```
+
+Дополнительно полезно:
+
+```text
+file_unique_id / reusable Telegram reference
+content hash
+duration
+width
+height
+moderation_note
+```
+
+---
+
+## 34. MediaSelector
+
+LLM возвращает только semantic `MediaIntent`.
+
+Пример:
+
+```text
+media_type = video_note
+scene = home
+outfit = shirt
+```
+
+Код:
 
 ```text
 MediaIntent
-→ filter enabled
-→ filter pool
-→ filter access
-→ filter transport capability
-→ filter required tags
-→ exclude already sent
+→ creator_id
+→ APPROVED only
+→ filter access class
+→ filter type/tags
+→ exclude already sent to this conversation
 → score
-→ random top-N
-→ selected asset
+→ random top-N / deterministic tie-break
+→ exact asset
 ```
 
-Если нет семантически подходящего media — `MEDIA_NOT_AVAILABLE`, без нерелевантной подмены.
+Если подходящего asset нет:
+
+```text
+MEDIA_NOT_AVAILABLE
+```
+
+Нельзя отправлять нерелевантный asset просто потому, что он есть.
 
 ---
 
-# ЧАСТЬ G — DIRECT_SALE, PATRON, GIFTS
+## 35. Media memory
 
-## 38. Commercial mode
+LLM не получает весь каталог.
 
-Behavior mode принадлежит Channel default и snapshot conversation:
+После отправки в conversation context добавляется semantic event, например:
+
+```text
+Sent media: series=home_04, type=video_note, scene=bedroom, view=front
+```
+
+Source of truth остается SQLite/MediaCatalog.
+
+---
+
+# ЧАСТЬ H — CONTROL BOT
+
+## 36. Control Bot
+
+Control Bot — отдельный private Bot API bot и главный admin UI.
+
+Он строится на существующем `GrammyBotBridge`/callback infrastructure Teleton.
+
+Принимать команды только от разрешенных admin Telegram IDs и только в приватном admin context.
+
+Control Bot не участвует в customer conversations.
+
+---
+
+## 37. Что переиспользуем из текущего AdminHandler
+
+Сохраняем концепции:
+
+- admin ID auth;
+- command parser;
+- status;
+- pause/resume primitives;
+- config mutation helpers там, где они подходят.
+
+Удаляем команды/логику, связанные с:
+
+```text
+wallet
+TON
+RAG
+modules
+plugins
+agent loop iteration count
+```
+
+---
+
+## 38. Основные команды
+
+Целевой набор:
+
+```text
+/status
+
+/creators
+/creator <id>
+/creator_start <id>
+/creator_stop <id>
+/creator_restart <id>
+
+/anon_start <creator_id>
+/anon_stop <creator_id>
+/anon_next <creator_id>
+
+/dialogs <creator_id>
+/dialog <conversation_id>
+/take <conversation_id>
+/ai <conversation_id>
+/hybrid <conversation_id>
+
+/media_pending <creator_id>
+/media_approve <asset_id>
+/media_reject <asset_id>
+/media_edit <asset_id>
+
+/mode <creator_id> direct|patron
+/price <creator_id> <stars>
+/offers <creator_id> on|off
+/media <creator_id> on|off
+
+/reload_prompts <creator_id>
+/errors
+/panic
+```
+
+Частые действия должны иметь inline buttons.
+
+---
+
+## 39. Human attention
+
+LLM может вернуть рекомендацию:
+
+```text
+human_attention.recommended = true
+```
+
+Это только signal.
+
+Код/Control Bot решает:
+
+- показать creator/admin alert;
+- предложить `Take over`;
+- ничего не менять автоматически.
+
+LLM не переключает conversation в HUMAN самостоятельно.
+
+---
+
+## 40. Panic
+
+```text
+disable new anon search
+disable new AI replies
+disable new offers/media intents
+keep persistence/recovery/control bot alive
+never undo confirmed payment state
+```
+
+Выход — только explicit admin action.
+
+---
+
+# ЧАСТЬ I — COMMERCE И GIFTS
+
+## 41. Commercial mode
+
+Default принадлежит CreatorProfile, conversation хранит snapshot/override при необходимости.
 
 ```text
 DIRECT_SALE
@@ -1123,8 +1235,8 @@ PATRON
 
 ```text
 OfferIntent
-→ MediaSelector reserve exact compatible unsent asset
-→ snapshot Channel price
+→ reserve compatible APPROVED unsent media
+→ snapshot current creator price
 → Offer WAITING
 → verified Gift from bound DM peer
 → PAID
@@ -1133,111 +1245,124 @@ OfferIntent
 
 ### PATRON
 
-Gift считается support event. LLM может мягко просить/реагировать, но Gift не превращается автоматически в покупку конкретного asset без отдельного Offer.
+Gift является support event. Он не превращается автоматически в покупку конкретного asset без отдельного Offer.
 
 ---
 
-## 39. GiftDetector
+## 42. Typed GiftEvent
 
-Нужен реальный MTProto fixture до финальной реализации.
-
-Сохранять максимально надежно:
+Low-level MTProto parsing Teleton переиспользуем, но результат должен быть domain event:
 
 ```text
-stable Telegram event key
-sender_peer_id
-gift ref/id
-gift stars/value
-received_at
-raw event snapshot for debugging
+GiftEvent
+├── event_key
+├── creator_id
+├── sender_peer_id
+├── gift_ref/id
+├── value_stars
+├── received_at
+└── raw_event_snapshot/debug ref
 ```
 
-Если sender/value нельзя определить надежно — автоматическая оплата не подтверждается.
+Если sender/value не определены надежно, автоматическая оплата не подтверждается.
+
+До production обязательно проверить реальным Gift fixture, какие поля Telegram дает стабильно.
 
 ---
 
-## 40. Gift matching
+## 43. Gift matching
 
 ```text
-Offer.status == waiting
-AND conversation.telegram_peer_id == gift.sender_peer_id
-AND gift.value >= offer.required_stars
-AND gift not already consumed
+Offer.status == WAITING
+AND offer.creator_id == GiftEvent.creator_id
+AND conversation.telegram_peer_id == GiftEvent.sender_peer_id
+AND GiftEvent.value_stars >= offer.required_stars
+AND GiftEvent.event_key not consumed
 → PAID
 ```
 
-Один Gift не оплачивает два Offers.
+Один Gift не оплачивает два Offer.
 
 Duplicate event не выполняет fulfillment повторно.
 
 ---
 
-## 41. Adult eligibility gate
+## 44. Fulfillment
 
-Любой explicit/paid adult flow проходит через hard code-side gate.
+Fulfillment выполняет код:
 
 ```text
-adult_status = unknown | verified | blocked
+PAID Offer
+→ fetch reserved media asset
+→ verify asset still APPROVED/available
+→ Telegram send
+→ persist delivery
+→ FULFILLED
 ```
 
-До `verified` код запрещает:
-
-- explicit paid asset selection;
-- explicit DIRECT_SALE fulfillment;
-- adult-only media send.
-
-LLM не может сама выставить `verified`.
-
-Механизм проверки eligibility реализуется отдельно, но gate должен существовать в доменной модели с первого этапа.
+LLM не участвует в подтверждении оплаты и exact-media fulfillment.
 
 ---
 
-# ЧАСТЬ H — PERSISTENCE
+# ЧАСТЬ J — PERSISTENCE
 
-## 42. SQLite source of truth
+## 45. SQLite source of truth
 
-```sql
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
-```
+Используем существующий SQLite/WAL foundation Teleton.
 
-Основные таблицы:
+Основные domain tables:
 
 ```text
-channels
-model_profiles
+creators
+anon_sources
 conversations
-messages
+conversation_messages
 conversation_facts
 conversation_summaries
 handoffs
 media_assets
-conversation_media
+media_series
+media_deliveries
+media_moderation_events
 offers
 gifts
-runtime_config
 admin_audit_events
 domain_events
 outbox
 ```
 
+Существующие `tg_messages/tg_chats/tg_users` можно оставить как raw Telegram feed, пока они полезны для транспорта/debug.
+
 ---
 
-## 43. `channels`
+## 46. `creators`
 
 ```text
 id TEXT PK
+display_name TEXT
 enabled BOOL
-transport_type TEXT
-anon_peer_id TEXT NULL
-language TEXT
-persona_profile_id TEXT
-behavior_profile_id TEXT
-model_profile_id TEXT
-media_pool_id TEXT
+runtime_home TEXT
+media_vault_chat_id TEXT
 commercial_mode TEXT
-offer_price_stars INTEGER
+default_offer_price_stars INTEGER
+created_at
+updated_at
+```
+
+Telegram session secrets и API credentials не должны храниться как открытый текст в domain rows.
+
+---
+
+## 47. `anon_sources`
+
+```text
+id TEXT PK
+creator_id TEXT FK
+enabled BOOL
+bot_peer_id TEXT
+bot_username TEXT NULL
+adapter_type TEXT
+language TEXT
 idle_timeout_seconds INTEGER
 search_watchdog_seconds INTEGER
 created_at
@@ -1246,340 +1371,441 @@ updated_at
 
 ---
 
-## 44. `model_profiles`
-
-```text
-id TEXT PK
-config_json TEXT
-created_at
-updated_at
-```
-
-`config_json` содержит task → provider/model/settings mappings.
-
-Секретные API keys не хранятся в SQLite; только secret references/env.
-
----
-
-## 45. `conversations`
+## 48. `conversations`
 
 ```text
 id INTEGER PK
-origin_channel_id TEXT
+creator_id TEXT FK
+anon_source_id TEXT NULL
 current_transport anon|dm
 state active|handoff_pending|ended
+control_mode ai|human|hybrid
 telegram_peer_id INTEGER NULL
 anon_generation INTEGER NULL
-persona_profile_id TEXT
-behavior_profile_id TEXT
-model_profile_id TEXT
+version INTEGER
 commercial_mode direct|patron
-adult_status unknown|verified|blocked
 last_activity_at
-manual_override_until NULL
 created_at
 updated_at
 ended_at NULL
 end_reason NULL
 ```
 
-Не более одной active DM conversation на Telegram peer.
+Не более одной active DM conversation на Telegram peer **внутри одного creator**.
 
 ---
 
-## 46. Outbox и recovery
+## 49. Outbox и recovery
 
-Все важные side effects выполняются через durable outbox:
+Важные side effects идут через durable outbox:
 
 ```text
 DB transaction
 → state change + outbox action
-→ worker executes Telegram send
+→ worker executes Telegram side effect
 → mark delivered
 ```
 
 Особенно:
 
-- paid media fulfillment;
-- handoff command;
-- admin-critical notifications.
+```text
+paid media fulfillment
+handoff command
+critical control-bot notification
+```
 
-После crash система поднимает:
+После crash runtime восстанавливает:
 
 ```text
-pending incoming messages
 pending outbox
-paid but unfulfilled Offers
-channel states needing reconcile
+PAID but not FULFILLED offers
+anon state needing reconcile
+unfinished moderation/admin actions where applicable
 ```
 
 ---
 
-# ЧАСТЬ I — OBSERVABILITY
+# ЧАСТЬ K — OBSERVABILITY
 
-## 47. Domain events
+## 50. Domain events
 
 Минимум:
 
 ```text
+creator_runtime_started
+creator_runtime_stopped
 conversation_created
 anon_room_started
 anon_room_ended
 handoff_offered
 handoff_confirmed
+control_mode_changed
+creator_manual_message
 llm_call
 llm_fallback
+media_submitted
+media_approved
+media_rejected
 media_sent
 offer_created
 gift_received
 offer_paid
 offer_fulfilled
-fulfillment_blocked
 admin_command
 error
 ```
 
-Каждый event включает `channel_id` и `conversation_id`, где применимо.
+Каждый event включает `creator_id` и `conversation_id`, где применимо.
 
 ---
 
-## 48. Метрики по Channel/Model
+## 51. Метрики
 
-Считать:
+Считать по creator:
 
 ```text
-rooms started
+anon rooms started
 messages received/sent
 handoff rate
 DM continuation rate
 Gift count/value
 Offer conversion
 media sends
-LLM latency
-LLM error rate
+LLM latency/error rate
 fallback rate
-input/output tokens
-estimated cost
+tokens/cost where available
 conversation duration
+AI/HUMAN/HYBRID distribution
 ```
-
-Это позволяет A/B сравнивать модели и Channel без изменения core.
 
 ---
 
-# ЧАСТЬ J — ЧТО НЕ СТРОИМ СЕЙЧАС
+# ЧАСТЬ L — ЧТО НЕ СТРОИМ СЕЙЧАС
 
-## 49. Не нужно для MVP
+## 52. Не нужно для MVP
 
-- микросервисы;
-- Postgres;
-- Redis;
-- Kubernetes;
-- Celery/RQ;
-- vector DB для обычного диалога;
-- runtime image/video generation;
-- несколько визуально разных девушек;
-- marketplace;
-- autonomous agent tool loop;
-- MCP как обязательная часть;
-- WebUI как primary admin;
-- сложная relationship simulation;
-- автоматическое vision tagging всего Vault.
+```text
+microservices
+Postgres
+Redis
+Kubernetes
+vector DB
+runtime image/video generation
+creator-specific LLM routing
+ModelProfile table
+Channel abstraction as core domain
+WebUI as primary admin
+MCP
+autonomous agent tool loop
+plugin marketplace
+complex relationship simulator
+automatic vision tagging of Media Vault
+```
 
 Базовый target:
 
 ```text
-1 Node.js/TypeScript process
-+ Teleton/GramJS Telegram user session
+CreatorSupervisor
++ 1..N isolated CreatorRuntime
++ GramJS user sessions
 + separate Telegram Control Bot
-+ SQLite/WAL
-+ ModelRouter
-+ one or more configurable Channels
-+ Media Vault
++ SQLite/WAL per runtime/domain
++ shared LLM provider configuration
++ ConversationService
++ AnonAdapter/AnonController
++ Media Vault + moderation
++ Gifts/Offers
 ```
 
 ---
 
-# ЧАСТЬ K — TARGET MODULE BOUNDARIES
+# ЧАСТЬ M — TARGET MODULE BOUNDARIES
 
-## 50. Целевая схема модулей
+## 53. Целевая схема
 
-Названия могут меняться, границы ответственности — нет.
+Физически переносить весь существующий Teleton в новые папки одним коммитом не нужно.
+
+Границы ответственности:
 
 ```text
 src/
-├── infrastructure/
-│   ├── telegram/
-│   │   ├── user-session/
-│   │   ├── dm-adapter/
-│   │   ├── anon-adapters/
-│   │   ├── media-sender/
-│   │   └── gift-detector/
-│   ├── control-bot/
-│   ├── llm-providers/
-│   └── sqlite/
+├── runtime/
+│   ├── creator-runtime.ts
+│   ├── creator-supervisor.ts
+│   └── recovery.ts
+│
+├── telegram/
+│   ├── client.ts                  # reuse Teleton
+│   ├── bridge-interface.ts        # reuse/extend
+│   ├── bridges/
+│   │   ├── user.ts                # reuse/modify
+│   │   └── bot.ts                 # Control Bot base
+│   ├── handlers.ts                # reuse infra, replace decision path
+│   ├── debounce.ts                # reuse
+│   ├── flood-retry.ts             # reuse
+│   ├── offset-store.ts            # reuse
+│   └── anon/
+│       ├── adapter.ts
+│       └── controller.ts
+│
+├── control-bot/
+│   ├── commands.ts
+│   ├── callbacks.ts
+│   ├── moderation.ts
+│   └── alerts.ts
+│
+├── llm/
+│   ├── client.ts                  # extracted Teleton provider client
+│   ├── model-request.ts
+│   ├── provider-fallback.ts
+│   ├── service.ts
+│   ├── chat-decision.ts
+│   └── decision-validator.ts
 │
 ├── domain/
-│   ├── channels/
+│   ├── creators/
 │   ├── conversations/
 │   ├── handoff/
 │   ├── media/
-│   ├── commerce/
-│   └── admin/
+│   └── commerce/
 │
 ├── application/
-│   ├── event-router/
-│   ├── context-builder/
-│   ├── model-router/
-│   ├── llm-service/
-│   ├── decision-validator/
-│   ├── action-coordinator/
-│   ├── recovery/
-│   └── analytics/
+│   ├── transport-router.ts
+│   ├── context-builder.ts
+│   ├── action-coordinator.ts
+│   └── analytics.ts
 │
 └── prompts/
     ├── system/
-    ├── persona/
-    ├── behavior/
-    ├── channel/
+    ├── creators/
     └── examples/
 ```
 
-Teleton existing modules можно временно использовать напрямую и постепенно оборачивать adapters. Не требуется сначала физически разнести весь проект по этим папкам.
+Это target boundaries, а не требование немедленно переименовать все существующие файлы.
 
 ---
 
-# ЧАСТЬ L — MIGRATION FROM TELETON
+# ЧАСТЬ N — MIGRATION FROM TELETON
 
-## 51. Порядок миграции
+## 54. Phase 0 — transport spike
 
-### Phase 0 — transport spike
+До большого удаления подтвердить:
 
-До большого удаления кода подтвердить:
-
-1. dedicated user-account стабильно получает/отправляет обычный DM;
+1. dedicated user-account стабильно получает и отправляет DM;
 2. configured anonymous bot проходит patched bot filter;
 3. видны нужные NewMessage/MessageEdited/buttons/raw events;
-4. photo/video/video_note реально отправляются;
-5. реальный Gift дает sender/value/stable event key, достаточные для matching.
+4. photo/video/video_note реально принимаются и отправляются;
+5. Media Vault channel updates читаются;
+6. реальный Gift дает sender/value/stable event key, достаточные для matching;
+7. manual outgoing creator можно надежно отличить от programmatic outgoing.
 
-### Phase 1 — isolate infrastructure
+---
 
-- зафиксировать Telegram bridge/session/queue primitives;
-- отключить autonomous AgentRuntime из production path;
+## 55. Phase 1 — deterministic message path
+
+- сохранить Telegram infra `client/bridge/queue/debounce/dedup/flood retry`;
+- отключить `AgentRuntime.processMessage()` из customer production path;
 - отключить LLM-accessible Telegram tools;
-- отключить TON/MCP/general-agent initialization;
-- оставить provider adapters и SQLite primitives.
+- добавить `TransportRouter`;
+- добавить `ConversationService`;
+- добавить `AnonkaLLMService → ChatDecision`;
+- добавить `ActionCoordinator`.
 
-### Phase 2 — Channels + Control Bot
+---
 
-- таблица/config `channels`;
-- `ChannelManager`;
-- per-channel `AnonController`;
-- отдельный private Control Bot;
-- `/status`, start/stop/next;
+## 56. Phase 2 — creator runtime + control bot
+
+- `CreatorProfile`;
+- `CreatorRuntime`;
+- `CreatorSupervisor`;
+- разнести user runtime и bot control plane;
+- перепрофилировать существующий Admin/Bot layer;
+- `/status`, creator start/stop/restart;
+- AI/HUMAN/HYBRID commands;
 - admin audit.
 
-### Phase 3 — ModelRouter + ChatDecision
+На первом этапе достаточно одного creator runtime, но без hardcode singleton business logic.
 
-- ModelProfile;
-- per-channel model assignment;
-- structured ChatDecision;
-- validation/repair/text-only fallback;
-- logging provider/model usage.
+---
 
-### Phase 4 — conversations/memory/handoff
+## 57. Phase 3 — conversation memory + handoff
 
-- per-conversation facts;
+- domain `conversation_id`;
+- raw Telegram chat → logical conversation mapping;
+- facts;
 - rolling summary;
+- recent messages;
 - anon→DM continuity;
 - direct DM;
-- manual override;
-- stale guards.
+- manual creator outgoing;
+- stale guards;
+- reuse/rewrite Teleton compaction where appropriate.
 
-### Phase 5 — Media Vault + commerce
+---
 
-- MediaIndexer;
+## 58. Phase 4 — Media Vault
+
+- extend media types with `video_note` and `media_group_id`;
+- Media Vault ingestion per creator;
+- strict manual tags;
+- PENDING moderation;
+- Control Bot moderation cards;
+- `APPROVED` catalog;
 - MediaSelector;
-- Gifts;
+- per-conversation delivery history.
+
+---
+
+## 59. Phase 5 — commerce
+
+- typed GiftEvent from existing MTProto service parsing;
+- Gift fixture verification;
+- OfferService;
+- GiftMatcher;
 - DIRECT_SALE;
 - PATRON;
-- adult eligibility gate;
-- durable fulfillment.
-
-### Phase 6 — cleanup
-
-После доказанного нового runtime удалить реально неиспользуемые:
-
-- TON/DEX/DNS/wallet code;
-- generic agent tools;
-- MCP runtime;
-- WebUI/marketplace, если не нужен;
-- глобальную user-memory логику, конфликтующую с conversation isolation.
-
-Не удалять инфраструктуру до того, как новый path покрыт tests/spike.
+- durable/idempotent fulfillment.
 
 ---
 
-## 52. Definition of Done архитектурного перехода
+## 60. Phase 6 — cleanup
 
-Переход на новую архитектуру считается завершенным, когда:
-
-1. production path не использует autonomous AgentRuntime;
-2. anonymous bot allowlist работает;
-3. каждый Channel имеет независимый controller/state;
-4. разные Channel реально могут иметь разные ModelProfiles;
-5. Control Bot полностью управляет channels/models/modes/prices;
-6. DM contexts изолированы;
-7. anon→DM сохраняет conversation;
-8. LLM выдает только ChatDecision;
-9. Telegram/system/payment actions выполняет ActionCoordinator/code-side services;
-10. Media Vault выбирается семантически кодом;
-11. Gift matching идемпотентен;
-12. adult eligibility gate нельзя обойти через prompt;
-13. crash recovery не теряет paid fulfillment;
-14. SQLite остается source of truth;
-15. метрики позволяют сравнивать Channel и ModelProfile.
-
----
-
-## 53. Короткая итоговая схема
+После доказанного нового production path удалить:
 
 ```text
-                         TELEGRAM CONTROL BOT
-                                  │
-                           AdminCommandBus
-                                  │
-                                  ▼
-┌──────────────────────────── ANONKA CORE ────────────────────────────┐
-│                                                                    │
-│ ChannelManager                                                     │
-│   ├─ Channel A → AnonController A ─┐                               │
-│   └─ Channel B → AnonController B ─┼─→ ConversationService         │
-│                                    │          │                    │
-│ Real DMs ──────────────────────────┘          ▼                    │
-│                                         ContextBuilder             │
-│                                              │                     │
-│                                  conversation.model_profile        │
-│                                              ▼                     │
-│                                          ModelRouter               │
-│                                              │                     │
-│                                   local / remote providers         │
-│                                              │                     │
-│                                              ▼                     │
-│                                         ChatDecision               │
-│                                              │                     │
-│                                      DecisionValidator             │
-│                                              │                     │
-│                                      ActionCoordinator             │
-│                                    ┌─────────┼─────────┐           │
-│                                    ▼         ▼         ▼           │
-│                                 Telegram   Media    Commerce        │
-│                                    │       Vault      Gifts         │
-│                                    └─────────┬─────────┘           │
-│                                              ▼                     │
-│                                         SQLite/WAL                 │
-└────────────────────────────────────────────────────────────────────┘
+TON/DEX/DNS/wallet
+Gocoon
+AgentRuntime/tool loop
+generic agent tools
+Tool RAG
+MCP
+plugin system/SDK marketplace
+WebUI
+Management API if still unused
+heartbeat/scheduled agent tasks
+vector embeddings/sqlite-vec
+RVC
+Teleton-specific docs/code paths that no longer используются
 ```
 
-Это и есть целевая архитектура Anonka. Все последующие изменения кода должны проверяться против нее.
+После удаления обновить `package.json`, build scripts и CI под реально оставшиеся зависимости.
+
+---
+
+# ЧАСТЬ O — DOCUMENTATION MIGRATION
+
+## 61. Документация, которую нужно переписать
+
+После стабилизации новой архитектуры обновить:
+
+```text
+README.md
+GETTING_STARTED.md
+config.example.yaml
+docs/configuration.md
+docs/telegram-setup.md
+docs/deployment.md
+```
+
+Удалить/архивировать Teleton-specific документы, если их соответствующий runtime удален:
+
+```text
+TON/wallet docs
+plugin docs
+management API docs
+TOOLS.md
+docs-sdk/
+```
+
+`LICENSE` и необходимые attribution сохраняются.
+
+Старый Teleton `CHANGELOG.md` можно перенести в `docs/upstream/`, а новый `CHANGELOG.md` вести уже для Anonka.
+
+---
+
+# ЧАСТЬ P — DEFINITION OF DONE
+
+## 62. Архитектурный переход завершен, когда
+
+1. customer production path не использует autonomous `AgentRuntime`;
+2. Telegram user-account transport сохраняет dedupe/queue/retry/persistence преимущества Teleton;
+3. configured anonymous bot проходит allowlist exception, остальные bots игнорируются;
+4. физический Telegram chat anonymous bot не используется как conversation identity;
+5. каждый conversation изолирован;
+6. manual creator outgoing попадает в ту же историю и инвалидирует stale AI response;
+7. `AI | HUMAN | HYBRID` работает как явное состояние;
+8. anon→DM сохраняет тот же `conversation_id`;
+9. LLM возвращает только `ChatDecision`;
+10. Telegram/media/payment side effects выполняются code-side;
+11. общий Teleton provider layer используется вместо нового provider stack;
+12. Control Bot работает параллельно user runtime и переиспользует существующий bot layer;
+13. у каждого creator отдельный Media Vault;
+14. media проходит PENDING → APPROVED/REJECTED moderation;
+15. LLM не выбирает exact media asset;
+16. Gifts поступают в typed code-side pipeline;
+17. Gift matching и fulfillment идемпотентны;
+18. SQLite остается source of truth;
+19. несколько creator можно запустить как изолированные runtime без смешивания sessions/data/persona;
+20. TON/general-agent/MCP/tool-loop код больше не входит в production path и после migration удален.
+
+---
+
+## 63. Короткая итоговая схема
+
+```text
+                        TELEGRAM CONTROL BOT
+                                │
+                         CreatorSupervisor
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+       CreatorRuntime A  CreatorRuntime B  CreatorRuntime C
+              │                 │                 │
+       TG user account A TG user account B TG user account C
+              │                 │                 │
+       Conversations A   Conversations B   Conversations C
+       AnonSource A       AnonSource B       AnonSource C
+       Media Vault A      Media Vault B      Media Vault C
+              │                 │                 │
+              └─────────────────┼─────────────────┘
+                                ▼
+                         Shared LLM config
+                                │
+                         existing pi-ai /
+                         provider layer
+                                │
+                                ▼
+                           ChatDecision
+                                │
+                       DecisionValidator
+                                │
+                       ActionCoordinator
+                     ┌──────────┼──────────┐
+                     ▼          ▼          ▼
+                  Telegram     Media     Commerce
+                               Vault      Gifts
+```
+
+### Ключевой принцип перехода
+
+Не переписывать то, что Teleton уже делает хорошо.
+
+Сначала:
+
+```text
+reuse transport/provider/SQLite/bot infrastructure
+```
+
+затем:
+
+```text
+replace autonomous agent decision layer
+```
+
+и только после переключения production path:
+
+```text
+remove unused Teleton general-agent/TON/MCP/WebUI bloat
+```
+
+Это и есть целевая архитектура Anonka. Все последующие изменения кода и документации должны проверяться против нее.
