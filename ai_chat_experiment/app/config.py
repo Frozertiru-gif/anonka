@@ -27,6 +27,7 @@ class Settings:
     reply_delay_min: int = DEFAULT_REPLY_DELAY_MIN
     reply_delay_max: int = DEFAULT_REPLY_DELAY_MAX
     max_context_messages: int = DEFAULT_MAX_CONTEXT_MESSAGES
+    database_path: str = "data/anonka.sqlite3"
     dry_run: bool = False
 
 
@@ -74,6 +75,13 @@ def _get_optional_str(name: str, default: str) -> str:
     return value or default
 
 
+def _resolve_path(root_dir: Path, raw: str) -> str:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = root_dir / path
+    return str(path.resolve())
+
+
 def _validate_ranges(
     reply_delay_min: int,
     reply_delay_max: int,
@@ -116,5 +124,9 @@ def get_settings() -> Settings:
         reply_delay_min=reply_delay_min,
         reply_delay_max=reply_delay_max,
         max_context_messages=max_context_messages,
+        database_path=_resolve_path(
+            root_dir,
+            _get_optional_str("DATABASE_PATH", "data/anonka.sqlite3"),
+        ),
         dry_run=_parse_bool("DRY_RUN", default=False),
     )
