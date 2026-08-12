@@ -111,6 +111,16 @@ export class GrammyBotBridge implements ITelegramBridge {
     return Number(chatId);
   }
 
+  /**
+   * Bot-mode sends do NOT participate in OutgoingTracker correlation.
+   *
+   * Rationale: the Bot API assigns message_id server-side and exposes no
+   * client-generated random_id for sendMessage. More importantly, the Bot API
+   * never delivers the bot's own outgoing messages back as updates, so there
+   * is no manual-vs-programmatic classification problem to solve in bot mode.
+   * The creator-account correlation problem exists only on the MTProto user
+   * bridge (GramJSUserBridge), which handles it via random_id + UpdateMessageID.
+   */
   async sendMessage(options: SendMessageOptions): Promise<SentMessage> {
     if (!options.text || options.text.trim().length === 0) {
       log.debug("sendMessage skipped: empty text");
@@ -511,6 +521,7 @@ export class GrammyBotBridge implements ITelegramBridge {
       mediaType,
       timestamp: new Date(msg.date * 1000),
       replyToId: msg.reply_to_message?.message_id,
+      isOutgoing: false,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- bot mode stores a Grammy message where the interface types a GramJS Api.Message
       _rawMessage: msg.reply_to_message ? (msg as any) : undefined,
     };

@@ -1,4 +1,4 @@
-import { TelegramClient, Api } from "telegram";
+import { TelegramClient, Api, client as gramjsClientModule } from "telegram";
 import { Logger, LogLevel } from "telegram/extensions/Logger.js";
 import { StringSession } from "telegram/sessions/index.js";
 import { NewMessage } from "telegram/events/index.js";
@@ -7,6 +7,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { dirname } from "path";
 import { createInterface } from "readline";
 import { markdownToTelegramHtml } from "./formatting.js";
+import { toLong } from "../utils/gramjs-bigint.js";
 
 import { createLogger } from "../utils/logger.js";
 
@@ -410,6 +411,154 @@ export class TelegramUserClient {
       silent: options.silent,
       parseMode: parseMode === "none" ? undefined : parseMode,
       linkPreview: false,
+    });
+  }
+
+  /**
+   * Low-level text send that carries OUR random_id into the MTProto request.
+   * Mirrors the formatting behaviour of sendMessage() (markdown→HTML for
+   * "html" mode, linkPreview disabled) but returns the raw Updates result so
+   * the caller can extract the authoritative random_id → message_id mapping.
+   */
+  async sendMessageLowLevel(
+    entity: string | Api.TypePeer,
+    options: {
+      message: string;
+      randomId: bigint;
+      replyTo?: number;
+      silent?: boolean;
+      parseMode?: "html" | "md" | "md2" | "none";
+      linkPreview?: boolean;
+      replyMarkup?: Api.TypeReplyMarkup;
+    }
+  ): Promise<Api.TypeUpdates> {
+    const inputPeer = await this.client.getInputEntity(entity);
+    const parseMode = options.parseMode ?? "html";
+    const formattedMessage =
+      parseMode === "html" ? markdownToTelegramHtml(options.message) : options.message;
+
+    const [parsedMessage, entities] = await gramjsClientModule.messageParse._parseMessageText(
+      this.client,
+      formattedMessage,
+      parseMode === "none" ? false : parseMode
+    );
+
+    if (!parsedMessage) {
+      throw new Error("The message cannot be empty unless a file is provided");
+    }
+
+    const replyTo =
+      options.replyTo !== undefined
+        ? new Api.InputReplyToMessage({ replyToMsgId: options.replyTo })
+        : undefined;
+
+    const request = new Api.messages.SendMessage({
+      peer: inputPeer,
+      message: parsedMessage,
+      entities,
+      randomId: toLong(options.randomId),
+      replyTo,
+      silent: options.silent,
+      noWebpage: options.linkPreview === false ? true : undefined,
+      replyMarkup: options.replyMarkup,
+    });
+
+    return this.client.invoke(request);
+  }
+
+  /**
+   * Low-level media send carrying OUR random_id. The caller builds the
+   * InputMedia (upload happens outside) and receives the raw Updates result.
+   */
+  async sendMediaLowLevel(
+    entity: string | Api.TypePeer,
+    options: {
+      media: Api.TypeInputMedia;
+      message?: string;
+      randomId: bigint;
+      replyTo?: number;
+      silent?: boolean;
+      replyMarkup?: Api.TypeReplyMarkup;
+    }
+  ): Promise<Api.TypeUpdates> {
+    const inputPeer = await this.client.getInputEntity(entity);
+
+    const replyTo =
+      options.replyTo !== undefined
+        ? new Api.InputReplyToMessage({ replyToMsgId: options.replyTo })
+        : undefined;
+
+    const request = new Api.messages.SendMedia({
+      peer: inputPeer,
+      media: options.media,
+      message: options.message ?? "",
+      randomId: toLong(options.randomId),
+      replyTo,
+      silent: options.silent,
+      replyMarkup: options.replyMarkup,
+    });
+
+    return this.client.invoke(request);
+  }
+
+  /**
+   * Build an InputMedia from a file, uploading it if necessary.
+   * The upload itself happens before any SendMedia request, so an upload
+   * failure is a definite failure (no message was created).
+   */
+  async buildInputMedia(options: {
+    file: string | Buffer;
+    forceDocument?: boolean;
+    attributes?: Api.TypeDocumentAttribute[];
+    videoNote?: boolean;
+    supportsStreaming?: boolean;
+    mimeType?: string;
+  }): Promise<Api.TypeInputMedia> {
+    const { media } = await gramjsClientModule.uploads._fileToMedia(this.client, {
+      file: options.file,
+      forceDocument: options.forceDocument ?? false,
+      attributes: options.attributes,
+      videoNote: options.videoNote ?? false,
+      supportsStreaming: options.supportsStreaming ?? false,
+      mimeType: options.mimeType,
+    });
+
+    if (!media) {
+      throw new Error(
+        `Cannot use ${typeof options.file === "string" ? options.file : "buffer"} as file.`
+      );
+    }
+
+    return media;
+  }
+
+  /** Low-level forward carrying OUR random_ids. */
+  async forwardMessagesLowLevel(
+    fromPeer: string | Api.TypePeer,
+    toPeer: string | Api.TypePeer,
+    ids: number[],
+    randomIds: bigint[]
+  ): Promise<Api.TypeUpdates> {
+    const request = new Api.messages.ForwardMessages({
+      fromPeer,
+      toPeer,
+      id: ids,
+      randomId: randomIds.map((id) => toLong(id)),
+    });
+
+    return this.client.invoke(request);
+  }
+
+  /**
+   * Raw update hook for Api.UpdateMessageID — the authoritative
+   * random_id → message_id acknowledgement Telegram pushes for sends.
+   */
+  addUpdateMessageIdHandler(handler: (update: Api.UpdateMessageID) => void | Promise<void>): void {
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises -- GramJS event handler accepts async
+    this.client.addEventHandler(async (update) => {
+      if (update instanceof Api.UpdateMessageID) {
+        await handler(update);
+      }
     });
   }
 

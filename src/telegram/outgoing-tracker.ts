@@ -1,132 +1,308 @@
 import { createLogger } from "../utils/logger.js";
+import { getErrorMessage } from "../utils/errors.js";
 
 const log = createLogger("OutgoingTracker");
 
-interface PendingSend {
+/**
+ * Lifecycle of one programmatic outgoing send:
+ *
+ *   RESERVED → SENDING → ACKNOWLEDGED → OBSERVED
+ *                  ↘ AMBIGUOUS (network failure, may still be retried with the same randomId)
+ *
+ * Records are removed on definite failure (Telegram responded with an error —
+ * the message was never sent) and expired by TTL on stale/ambiguous states.
+ * ACKNOWLEDGED/OBSERVED records are retained briefly so duplicate outgoing
+ * updates are still classified as programmatic.
+ */
+export type PendingSendState = "RESERVED" | "SENDING" | "ACKNOWLEDGED" | "OBSERVED" | "AMBIGUOUS";
+
+export interface PendingSend {
   chatId: string;
   randomId: bigint;
-  timestamp: number;
+  state: PendingSendState;
+  telegramMessageId?: number;
+  reservedAt: number;
+  stateUpdatedAt: number;
+  attempts: number;
+  lastError?: string;
+}
+
+/** A send that never reaches an acknowledgement within this window is dead. */
+const RESERVED_TTL_MS = 60_000;
+/** Keep acknowledged/observed records to dedupe replayed outgoing updates. */
+const OBSERVED_RETENTION_MS = 120_000;
+/** Ambiguous network failures keep the correlation available longer. */
+const AMBIGUOUS_TTL_MS = 300_000;
+/** Cleanup sweep interval. */
+const CLEANUP_INTERVAL_MS = 30_000;
+/** Bounded wait for an exact ack when classifying an outgoing self-event. */
+const OUTGOING_ACK_WAIT_MS = 500;
+const OUTGOING_ACK_POLL_MS = 25;
+
+function messageKey(chatId: string, telegramMessageId: number): string {
+  return `${chatId}:${telegramMessageId}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * In-memory outgoing correlation tracker.
+ * Authoritative correlation store for programmatic outgoing messages.
  *
- * Phase 0 spike: tracks pending sends by randomId so we can distinguish
- * programmatic outgoing messages from manual creator messages when
- * the outgoing update arrives back from Telegram.
+ * Classification is EXACT ONLY:
+ * - randomId is the MTProto correlation primitive;
+ * - (chatId, telegramMessageId) is the exact observed-message key.
  *
- * Phase 1 replacement: durable Outbox table in creator.db.
+ * There is deliberately no chat/text/time heuristic fallback: an outgoing
+ * message without an exact binding is always creator_manual.
  */
 export class OutgoingTracker {
-  /** Pending sends, keyed by randomId string for fast lookup. */
-  private pending = new Map<string, PendingSend>();
-  /** Maximum age for a pending entry before eviction (ms). */
-  private maxAgeMs: number;
-  /** Cleanup timer interval. */
-  private cleanupInterval: NodeJS.Timeout | null = null;
+  private byRandomId = new Map<string, PendingSend>();
+  private byMessageKey = new Map<string, PendingSend>();
+  private cleanupTimer: NodeJS.Timeout | null = null;
 
-  constructor(maxAgeMs = 30_000) {
-    this.maxAgeMs = maxAgeMs;
-  }
-
-  /** Record a pending send before the network call. */
-  record(chatId: string, randomId: bigint): void {
+  /** Register a correlation BEFORE the network call. */
+  reserve(chatId: string, randomId: bigint): void {
     const key = randomId.toString();
-    this.pending.set(key, {
+    if (this.byRandomId.has(key)) {
+      log.warn(
+        { chatId, randomId: key },
+        "outgoing_correlation_mismatch: randomId already reserved"
+      );
+      return;
+    }
+    const now = Date.now();
+    this.byRandomId.set(key, {
       chatId,
       randomId,
-      timestamp: Date.now(),
+      state: "RESERVED",
+      reservedAt: now,
+      stateUpdatedAt: now,
+      attempts: 0,
     });
-    log.debug(`Tracked pending send: ${chatId}:${key}`);
+    log.debug({ chatId, randomId: key, state: "RESERVED" }, "outgoing_reserved");
   }
 
-  /** Check and consume a pending send match. Returns true if found. */
-  consume(chatId: string, randomId: bigint): boolean {
-    const key = randomId.toString();
-    const entry = this.pending.get(key);
-    if (!entry) return false;
-
-    const match = entry.chatId === chatId;
-    this.pending.delete(key);
-    if (match) {
-      log.debug(`Matched outgoing: ${chatId}:${key}`);
-    }
-    return match;
+  /** Transition to SENDING before the network attempt. Safe to call on retries. */
+  markSending(randomId: bigint): void {
+    const record = this.byRandomId.get(randomId.toString());
+    if (!record) return;
+    record.state = "SENDING";
+    record.attempts += 1;
+    record.stateUpdatedAt = Date.now();
   }
 
   /**
-   * Heuristic check: is there any recent pending send for this chat?
-   * Used when the randomId isn't directly available on the update.
-   * Consumes the oldest matching entry if found.
+   * Bind randomId → telegramMessageId from an authoritative source
+   * (RPC result UpdateMessageID or raw update stream).
+   *
+   * Idempotent: a repeated acknowledgement with the same values is a no-op.
+   * A chatId mismatch is a suspicious correlation mismatch: the record is
+   * preserved untouched and false is returned.
    */
-  consumeByChat(chatId: string): { matched: boolean; randomId?: bigint } {
-    let oldest: PendingSend | undefined;
-    let oldestKey: string | undefined;
-
-    for (const [key, entry] of this.pending) {
-      if (entry.chatId !== chatId) continue;
-      if (!oldest || entry.timestamp < oldest.timestamp) {
-        oldest = entry;
-        oldestKey = key;
-      }
-    }
-
-    if (oldest && oldestKey) {
-      this.pending.delete(oldestKey);
-      log.debug(`Matched outgoing by chat: ${chatId}`);
-      return { matched: true, randomId: oldest.randomId };
-    }
-
-    return { matched: false };
-  }
-
-  /** Check if this outgoing message is programmatic (has a pending send). Does NOT consume. */
-  isProgrammatic(chatId: string, randomId: bigint): boolean {
+  acknowledge(randomId: bigint, telegramMessageId: number, chatId?: string): boolean {
     const key = randomId.toString();
-    const entry = this.pending.get(key);
-    return entry !== undefined && entry.chatId === chatId;
-  }
-
-  /** Start periodic cleanup of stale entries. */
-  startCleanup(intervalMs = 60_000): void {
-    if (this.cleanupInterval) return;
-    this.cleanupInterval = setInterval(() => this.cleanup(), intervalMs);
-    this.cleanupInterval.unref?.();
-  }
-
-  /** Stop cleanup timer. */
-  stopCleanup(): void {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
+    const record = this.byRandomId.get(key);
+    if (!record) {
+      log.debug(
+        { randomId: key, telegramMessageId },
+        "outgoing_rpc_ack: no pending record (late or foreign acknowledgement)"
+      );
+      return false;
     }
+
+    if (chatId !== undefined && record.chatId !== chatId) {
+      log.warn(
+        {
+          randomId: key,
+          telegramMessageId,
+          expectedChatId: record.chatId,
+          actualChatId: chatId,
+        },
+        "outgoing_correlation_mismatch"
+      );
+      return false;
+    }
+
+    if (record.telegramMessageId !== undefined) {
+      if (record.telegramMessageId === telegramMessageId) {
+        return true; // duplicate ack of an already bound send — no-op
+      }
+      log.warn(
+        {
+          randomId: key,
+          boundMessageId: record.telegramMessageId,
+          conflictingMessageId: telegramMessageId,
+        },
+        "outgoing_correlation_mismatch"
+      );
+      return false;
+    }
+
+    record.telegramMessageId = telegramMessageId;
+    record.state = "ACKNOWLEDGED";
+    record.stateUpdatedAt = Date.now();
+    this.byMessageKey.set(messageKey(record.chatId, telegramMessageId), record);
+    log.debug(
+      { chatId: record.chatId, randomId: key, telegramMessageId, state: "ACKNOWLEDGED" },
+      "outgoing_rpc_ack"
+    );
+    return true;
   }
 
-  /** Remove entries older than maxAgeMs. */
-  private cleanup(): void {
-    const cutoff = Date.now() - this.maxAgeMs;
-    let removed = 0;
-    for (const [key, entry] of this.pending) {
-      if (entry.timestamp < cutoff) {
-        this.pending.delete(key);
-        removed++;
+  /** Non-mutating exact lookup of an observed message. */
+  peek(chatId: string, telegramMessageId: number): PendingSend | undefined {
+    return this.byMessageKey.get(messageKey(chatId, telegramMessageId));
+  }
+
+  /**
+   * Exact observation of an outgoing message. Only a record bound via
+   * acknowledge() is ever classified programmatic — nothing else.
+   * Idempotent: repeated observation of the same message stays programmatic.
+   */
+  observe(chatId: string, telegramMessageId: number): "programmatic" | "creator_manual" {
+    const record = this.byMessageKey.get(messageKey(chatId, telegramMessageId));
+    if (!record) {
+      return "creator_manual";
+    }
+    if (record.state === "ACKNOWLEDGED") {
+      record.state = "OBSERVED";
+      record.stateUpdatedAt = Date.now();
+    }
+    log.debug(
+      { chatId, telegramMessageId, randomId: record.randomId.toString() },
+      "outgoing_observed_programmatic"
+    );
+    return "programmatic";
+  }
+
+  /**
+   * Classify an outgoing self-event. Exact matching only, with a short
+   * bounded wait for the acknowledgement when the outgoing update raced
+   * ahead of the RPC result. Never guesses from chat/text/time.
+   */
+  async classifyOutgoing(
+    chatId: string,
+    telegramMessageId: number,
+    opts?: { waitMs?: number; pollMs?: number }
+  ): Promise<"programmatic" | "creator_manual"> {
+    const immediate = this.observe(chatId, telegramMessageId);
+    if (immediate === "programmatic") return immediate;
+
+    const waitMs = opts?.waitMs ?? OUTGOING_ACK_WAIT_MS;
+    const pollMs = opts?.pollMs ?? OUTGOING_ACK_POLL_MS;
+    const deadline = Date.now() + waitMs;
+
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      if (this.peek(chatId, telegramMessageId)) {
+        return this.observe(chatId, telegramMessageId);
       }
     }
-    if (removed > 0) {
-      log.debug(`Cleaned up ${removed} stale pending sends`);
+
+    log.debug({ chatId, telegramMessageId }, "outgoing_observed_manual");
+    return "creator_manual";
+  }
+
+  /** Definite failure: Telegram rejected the request, the message was never sent. */
+  markDefiniteFailure(randomId: bigint, error: unknown): void {
+    const key = randomId.toString();
+    const record = this.byRandomId.get(key);
+    if (!record) return;
+
+    this.byRandomId.delete(key);
+    if (record.telegramMessageId !== undefined) {
+      this.byMessageKey.delete(messageKey(record.chatId, record.telegramMessageId));
+    }
+    log.debug(
+      { chatId: record.chatId, randomId: key, state: "FAILED", error: getErrorMessage(error) },
+      "outgoing_send_failed"
+    );
+  }
+
+  /**
+   * Ambiguous failure: the request may or may not have reached Telegram.
+   * The record (and its randomId) is kept so a retry can reuse the SAME
+   * correlation primitive and a late acknowledgement can still bind.
+   */
+  markAmbiguousFailure(randomId: bigint, error: unknown): void {
+    const record = this.byRandomId.get(randomId.toString());
+    if (!record) return;
+
+    record.state = "AMBIGUOUS";
+    record.stateUpdatedAt = Date.now();
+    record.lastError = getErrorMessage(error);
+    log.debug(
+      {
+        chatId: record.chatId,
+        randomId: randomId.toString(),
+        state: "AMBIGUOUS",
+        error: record.lastError,
+      },
+      "outgoing_send_failed"
+    );
+  }
+
+  getByRandomId(randomId: bigint): PendingSend | undefined {
+    return this.byRandomId.get(randomId.toString());
+  }
+
+  /** Expire stale records. Returns the number of records removed. */
+  cleanupStale(now: number = Date.now()): number {
+    let removed = 0;
+    for (const [key, record] of this.byRandomId) {
+      const age = now - record.stateUpdatedAt;
+      let expired = false;
+
+      if (record.state === "RESERVED" || record.state === "SENDING") {
+        expired = age > RESERVED_TTL_MS;
+      } else if (record.state === "AMBIGUOUS") {
+        expired = age > AMBIGUOUS_TTL_MS;
+      } else {
+        expired = age > OBSERVED_RETENTION_MS;
+      }
+
+      if (expired) {
+        if (record.telegramMessageId !== undefined) {
+          this.byMessageKey.delete(messageKey(record.chatId, record.telegramMessageId));
+        }
+        this.byRandomId.delete(key);
+        removed += 1;
+        log.debug(
+          { chatId: record.chatId, randomId: key, state: record.state },
+          "outgoing_correlation_expired"
+        );
+      }
+    }
+    return removed;
+  }
+
+  /** Start the periodic cleanup sweep. Timer is unref'd so it never blocks exit. */
+  startCleanup(intervalMs: number = CLEANUP_INTERVAL_MS): void {
+    if (this.cleanupTimer) return;
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupStale();
+    }, intervalMs);
+    this.cleanupTimer.unref?.();
+  }
+
+  stopCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
     }
   }
 
-  /** Number of currently pending entries. */
-  get pendingCount(): number {
-    return this.pending.size;
+  clear(): void {
+    this.byRandomId.clear();
+    this.byMessageKey.clear();
   }
 
-  /** Clear all pending entries (for shutdown). */
-  clear(): void {
-    this.pending.clear();
+  get pendingCount(): number {
+    return this.byRandomId.size;
   }
 }
 
-/** Singleton tracker shared across all send operations. */
+/** Singleton tracker shared across all send operations in this process. */
 export const outgoingTracker = new OutgoingTracker();

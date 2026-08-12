@@ -271,11 +271,20 @@ export class MessageHandler {
       Number.isFinite(ownSenderId) &&
       message.senderId === ownSenderId
     ) {
+      // Phase 0: programmatic and creator_manual outgoing must NOT be
+      // conflated into one anonymous "self" bucket. Neither triggers the
+      // agent, but downstream conversation logic distinguishes them.
+      let reason = "Sender is self";
+      if (message.outgoingOrigin === "programmatic") {
+        reason = "Programmatic outgoing";
+      } else if (message.outgoingOrigin === "creator_manual") {
+        reason = "Creator manual outgoing";
+      }
       return {
         message,
         isAdmin,
         shouldRespond: false,
-        reason: "Sender is self",
+        reason,
       };
     }
 

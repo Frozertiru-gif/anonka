@@ -23,6 +23,10 @@ export interface TelegramMessage {
   buttons?: ParsedButton[][];
   /** Structured gift data, populated for service messages (gift events). */
   giftEvent?: GiftEvent;
+  /** True when this message was sent FROM our own account. */
+  isOutgoing?: boolean;
+  /** Exact transport-level origin of an outgoing message. */
+  outgoingOrigin?: "programmatic" | "creator_manual";
 }
 
 export interface ParsedButton {
