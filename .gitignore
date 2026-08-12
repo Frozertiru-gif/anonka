@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local configuration / secrets
+.env
+ai_chat_experiment/.env
+
+# Telethon session credentials
+*.session
+*.session-journal
+
+# Runtime data
+ai_chat_experiment/data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Local editor / OS files
+.DS_Store
+Thumbs.db
