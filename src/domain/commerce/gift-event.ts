@@ -88,20 +88,3 @@ export interface GiftEvent {
   offerExpired?: boolean;
   offerExpiresAt?: Date;
 }
-
-/**
- * Gift matching states per ARCHITECTURE.md Section 24.4:
- * DETECTED → MATCHED → CONSUMED
- * DETECTED → UNMATCHED → (reconciliation) → MATCHED
- */
-export type GiftStatus = "DETECTED" | "MATCHED" | "UNMATCHED" | "CONSUMED";
-
-/**
- * Reasons a gift may remain UNMATCHED.
- */
-export type UnmatchedReason =
-  | "anonymous_sender"
-  | "unknown_value"
-  | "no_peer_mapping"
-  | "no_transaction_key"
-  | "ambiguous_correlation";
