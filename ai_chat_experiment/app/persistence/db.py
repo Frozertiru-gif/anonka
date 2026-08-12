@@ -35,6 +35,8 @@ class Database:
             )
             """
         )
+        await conn.commit()
+
         cursor = await conn.execute("SELECT version FROM schema_migrations")
         rows = await cursor.fetchall()
         applied = {int(row[0]) for row in rows}
@@ -42,17 +44,20 @@ class Database:
         for version in sorted(MIGRATIONS):
             if version in applied:
                 continue
+
+            script = (
+                "BEGIN IMMEDIATE;\n"
+                + MIGRATIONS[version]
+                + f"\nINSERT INTO schema_migrations(version) VALUES ({version});\n"
+                + "COMMIT;"
+            )
             try:
-                await conn.execute("BEGIN IMMEDIATE")
-                await conn.executescript(MIGRATIONS[version])
-                await conn.execute(
-                    "INSERT INTO schema_migrations(version) VALUES (?)",
-                    (version,),
-                )
-                await conn.commit()
+                await conn.executescript(script)
             except Exception:
-                await conn.rollback()
-                raise
+                try:
+                    await conn.rollback()
+                finally:
+                    raise
 
     async def close(self) -> None:
         if self._conn is not None:
