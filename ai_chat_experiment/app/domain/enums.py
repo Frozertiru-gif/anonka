@@ -1,29 +1,29 @@
-from enum import StrEnum
+from enum import Enum
 
 
-class ConversationChannel(StrEnum):
+class ConversationChannel(str, Enum):
     ANON = "anon"
     DM = "dm"
 
 
-class ConversationState(StrEnum):
+class ConversationState(str, Enum):
     ACTIVE = "active"
     HANDOFF_PENDING = "handoff_pending"
     ENDED = "ended"
 
 
-class MessageRole(StrEnum):
+class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
 
 
-class MessageTransport(StrEnum):
+class MessageTransport(str, Enum):
     ANON = "anon"
     DM = "dm"
 
 
-class MessageKind(StrEnum):
+class MessageKind(str, Enum):
     TEXT = "text"
     SERVICE = "service"
     MEDIA = "media"
@@ -31,7 +31,7 @@ class MessageKind(StrEnum):
     INTERNAL = "internal"
 
 
-class MessageSource(StrEnum):
+class MessageSource(str, Enum):
     PARTNER = "partner"
     LLM = "llm"
     MANUAL = "manual"
