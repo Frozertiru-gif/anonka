@@ -1,2 +1,25 @@
-npx tsc --noEmit
-npx lint-staged
+#!/bin/sh
+set -e
+
+# GitHub Desktop runs hooks with its bundled Git environment, which may not
+# expose npm/npx (or their bash wrapper) on PATH. Invoke Node directly so the
+# same checks work from both GitHub Desktop and an interactive terminal.
+if [ -x "/c/Program Files/nodejs/node.exe" ]; then
+  node_exe="/c/Program Files/nodejs/node.exe"
+elif command -v node >/dev/null 2>&1; then
+  node_exe="$(command -v node)"
+else
+  echo "pre-commit: Node.js was not found. Install Node.js or add it to PATH." >&2
+  exit 1
+fi
+
+# The root typecheck imports the local workspace package. Its published entry
+# points to packages/sdk/dist, so build that package first when the output is
+# absent or stale (dist is intentionally ignored by Git).
+(
+  cd packages/sdk
+  "$node_exe" ../../node_modules/tsup/dist/cli-default.js
+)
+
+"$node_exe" node_modules/typescript/bin/tsc --noEmit
+"$node_exe" node_modules/lint-staged/bin/lint-staged.js
