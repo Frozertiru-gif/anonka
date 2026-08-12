@@ -12,6 +12,7 @@
  * The two are independent: a known sender may set nameHidden=true (we still
  * know their id), and an anonymous Gift may or may not carry nameHidden.
  */
+import type { NormalizedStarsAmount } from "./stars-amount.js";
 export type GiftEventKind =
   | "gift_received"
   | "gift_unique"
@@ -80,7 +81,8 @@ export interface GiftEvent {
   giftMsgId?: number;
 
   // ── Purchase offer fields ───────────────────────────────────────────────
-  offerPriceStars?: string;
+  /** Exact offer price (Stars or TON), normalized without loss. */
+  offerPrice?: NormalizedStarsAmount;
   offerAccepted?: boolean;
   offerDeclined?: boolean;
   offerExpired?: boolean;

@@ -104,9 +104,21 @@ describe("normalizeStarsAmount", () => {
     expect(n.units).toBe("-2");
   });
 
-  it("StarsTonAmount - asset ton", () => {
-    const n = normalizeStarsAmount(makeStarsTonAmount(42n));
-    expect(n).toEqual({ asset: "ton", units: "42", nanos: 0, decimal: "42" });
+  it("StarsTonAmount - asset ton, amount is minimal units (1e-9 TON)", () => {
+    const n = normalizeStarsAmount(makeStarsTonAmount(1_000_000_000n));
+    expect(n).toEqual({ asset: "ton", units: "1", nanos: 0, decimal: "1" });
+  });
+
+  it("StarsTonAmount - fractional ton (500000000 nanoton = 0.5 TON)", () => {
+    const n = normalizeStarsAmount(makeStarsTonAmount(500_000_000n));
+    expect(n).toEqual({ asset: "ton", units: "0", nanos: 500000000, decimal: "0.5" });
+  });
+
+  it("StarsTonAmount - negative ton", () => {
+    const n = normalizeStarsAmount(makeStarsTonAmount(-2_500_000_000n));
+    expect(n.asset).toBe("ton");
+    expect(n.decimal).toBe("-2.5");
+    expect(n.units).toBe("-2");
   });
 });
 
@@ -377,9 +389,36 @@ describe("scanStarsTransactions", () => {
     expect(r.pages).toBe(2);
   });
 
-  it("F: maxTransactions reached - complete=false", async () => {
+  it("F: page truncated by maxTransactions with more pages - complete=false", async () => {
     const client = makeClient([
-      makeStatus({ history: [makeTx({ id: "a" }), makeTx({ id: "b" })], nextOffset: "p2" }),
+      makeStatus({
+        history: [makeTx({ id: "a" }), makeTx({ id: "b" }), makeTx({ id: "c" })],
+        nextOffset: "p2",
+      }),
+    ]);
+    const r = await scanStarsTransactions(client, { maxTransactions: 2 });
+    expect(r.stopReason).toBe("max_transactions");
+    expect(r.complete).toBe(false);
+    expect(r.transactions).toHaveLength(2);
+  });
+
+  it("maxTransactions reached exactly on the last page (no nextOffset) - complete=true", async () => {
+    // The final page has exactly maxTransactions transactions and no nextOffset:
+    // history truly ended, so this must be complete, not truncated.
+    const client = makeClient([
+      makeStatus({ history: [makeTx({ id: "a" }), makeTx({ id: "b" })] }),
+    ]);
+    const r = await scanStarsTransactions(client, { maxTransactions: 2 });
+    expect(r.stopReason).toBe("history_end");
+    expect(r.complete).toBe(true);
+    expect(r.transactions).toHaveLength(2);
+  });
+
+  it("page truncated by maxTransactions mid-page - complete=false even without nextOffset", async () => {
+    // One page with 3 transactions but maxTransactions=2: the page is not fully
+    // consumed, so even with no nextOffset the result is incomplete.
+    const client = makeClient([
+      makeStatus({ history: [makeTx({ id: "a" }), makeTx({ id: "b" }), makeTx({ id: "c" })] }),
     ]);
     const r = await scanStarsTransactions(client, { maxTransactions: 2 });
     expect(r.stopReason).toBe("max_transactions");

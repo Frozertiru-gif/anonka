@@ -195,7 +195,7 @@ describe("parseGiftServiceAction — purchase offers", () => {
       msgSenderPeer: new Api.PeerUser({ userId: toLong(77n) }),
     }) as GiftEvent;
     expect(e.kind).toBe("gift_offer_received");
-    expect(e.offerPriceStars).toBe("500");
+    expect(e.offerPrice).toEqual({ asset: "stars", units: "500", nanos: 0, decimal: "500" });
     expect(e.offerAccepted).toBe(false);
     expect(e.offerDeclined).toBe(false);
     expect(e.offerExpiresAt?.getTime()).toBe(1700000100 * 1000);
@@ -216,6 +216,38 @@ describe("parseGiftServiceAction — purchase offers", () => {
       msgSenderPeer: new Api.PeerUser({ userId: toLong(77n) }),
     }) as GiftEvent;
     expect(e.offerAccepted).toBe(true);
+  });
+
+  it("offer price with nanos is preserved exactly", () => {
+    const action = new Api.MessageActionStarGiftPurchaseOffer({
+      gift: uniqueGift(),
+      price: new Api.StarsAmount({ amount: toLong(500n), nanos: 250000000 }),
+      expiresAt: 1700000100,
+    });
+    const e = parseGiftServiceAction(action, {
+      ...CTX,
+      msgSenderPeer: new Api.PeerUser({ userId: toLong(77n) }),
+    }) as GiftEvent;
+    expect(e.offerPrice).toEqual({
+      asset: "stars",
+      units: "500",
+      nanos: 250000000,
+      decimal: "500.25",
+    });
+  });
+
+  it("offer price in TON is normalized via minimal units", () => {
+    const action = new Api.MessageActionStarGiftPurchaseOffer({
+      gift: uniqueGift(),
+      price: new Api.StarsTonAmount({ amount: toLong(500_000_000n) }),
+      expiresAt: 1700000100,
+    });
+    const e = parseGiftServiceAction(action, {
+      ...CTX,
+      msgSenderPeer: new Api.PeerUser({ userId: toLong(77n) }),
+    }) as GiftEvent;
+    expect(e.offerPrice).toEqual({ asset: "ton", units: "0", nanos: 500000000, decimal: "0.5" });
+    expect(formatGiftEventText(e)).toContain("0.5 TON");
   });
 
   it("L: explicit declined offer", () => {

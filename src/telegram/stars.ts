@@ -1,6 +1,7 @@
 import { Api } from "telegram";
 import type { TelegramClient } from "telegram";
 import { peerToStableIdentity, normalizeStarGiftIdentity } from "./gift-parser.js";
+import { normalizeStarsAmount, type NormalizedStarsAmount } from "./stars-amount.js";
 
 /**
  * Telegram Stars transaction ingestion / normalization / pagination.
@@ -13,63 +14,12 @@ import { peerToStableIdentity, normalizeStarGiftIdentity } from "./gift-parser.j
 
 // ── Monetary representation ───────────────────────────────────────────────
 
-export type StarsAsset = "stars" | "ton";
-
-/**
- * Exact monetary amount. No floating point is used as a canonical value.
- *
- * - `units`   — integer component as a decimal string (no precision loss).
- * - `nanos`   — signed nanostar fraction component.
- * - `decimal` — exact normalized decimal string (e.g. "5", "5.25", "-2.5").
- * - `asset`   — "stars" or "ton".
- */
-export interface NormalizedStarsAmount {
-  asset: StarsAsset;
-  units: string;
-  nanos: number;
-  decimal: string;
-}
-
-const NANOS_PER_STAR = 1_000_000_000;
-
-/** Format integer units + signed nanos into an exact decimal string. */
-export function formatStarsDecimal(units: string, nanos: number): string {
-  if (nanos === 0) return units;
-
-  const unitsBig = BigInt(units);
-  const totalNanos = unitsBig * BigInt(NANOS_PER_STAR) + BigInt(nanos);
-
-  const negative = totalNanos < 0n;
-  const abs = negative ? -totalNanos : totalNanos;
-  const whole = abs / BigInt(NANOS_PER_STAR);
-  const fraction = abs % BigInt(NANOS_PER_STAR);
-
-  const fractionStr = fraction.toString().padStart(9, "0").replace(/0+$/, "");
-  const decimal = fractionStr.length > 0 ? `${whole.toString()}.${fractionStr}` : whole.toString();
-  return negative ? `-${decimal}` : decimal;
-}
-
-/** Normalize a Telegram StarsAmount / StarsTonAmount into an exact amount. */
-export function normalizeStarsAmount(amount: Api.TypeStarsAmount): NormalizedStarsAmount {
-  if (amount instanceof Api.StarsAmount) {
-    const units = amount.amount.toString();
-    const nanos = amount.nanos;
-    return {
-      asset: "stars",
-      units,
-      nanos,
-      decimal: formatStarsDecimal(units, nanos),
-    };
-  }
-  if (amount instanceof Api.StarsTonAmount) {
-    const units = amount.amount.toString();
-    return { asset: "ton", units, nanos: 0, decimal: units };
-  }
-  // Monetary corruption is worse than a hard failure.
-  throw new Error(
-    `Unsupported StarsAmount constructor: ${(amount as { className?: string }).className}`
-  );
-}
+export {
+  type StarsAsset,
+  type NormalizedStarsAmount,
+  formatStarsDecimal,
+} from "../domain/commerce/stars-amount.js";
+export { normalizeStarsAmount } from "./stars-amount.js";
 
 // ── Peer representation ────────────────────────────────────────────────────
 
@@ -342,17 +292,28 @@ export async function scanStarsTransactions(
       outbound,
     });
 
+    // Truncated = we stopped adding because maxTransactions was reached while
+    // there was still at least one more unseen transaction on THIS page.
+    let truncated = false;
     for (const tx of page.transactions) {
       if (seenIds.has(tx.id)) continue;
+      if (transactions.length >= maxTransactions) {
+        truncated = true;
+        break;
+      }
       seenIds.add(tx.id);
       transactions.push(tx);
-      if (transactions.length >= maxTransactions) {
-        return { transactions, complete: false, stopReason: "max_transactions", pages };
-      }
     }
 
     if (page.nextOffset === undefined) {
+      if (truncated) {
+        return { transactions, complete: false, stopReason: "max_transactions", pages };
+      }
       return { transactions, complete: true, stopReason: "history_end", pages };
+    }
+
+    if (truncated) {
+      return { transactions, complete: false, stopReason: "max_transactions", pages };
     }
 
     if (seenOffsets.has(page.nextOffset)) {
@@ -430,6 +391,9 @@ export async function pollNewTransactions(
       inbound: true,
     });
 
+    // Truncated = we stopped adding because maxTransactions was reached while
+    // there was still at least one more unseen transaction on THIS page.
+    let truncated = false;
     for (const tx of page.transactions) {
       if (sinceId !== null && tx.id === sinceId) {
         return {
@@ -441,9 +405,16 @@ export async function pollNewTransactions(
         };
       }
       if (seenIds.has(tx.id)) continue;
+      if (transactions.length >= maxTransactions) {
+        truncated = true;
+        break;
+      }
       seenIds.add(tx.id);
       transactions.push(tx);
-      if (transactions.length >= maxTransactions) {
+    }
+
+    if (page.nextOffset === undefined) {
+      if (truncated) {
         return {
           transactions,
           cursorFound: false,
@@ -452,10 +423,17 @@ export async function pollNewTransactions(
           pages,
         };
       }
+      return { transactions, cursorFound: false, complete: true, stopReason: "history_end", pages };
     }
 
-    if (page.nextOffset === undefined) {
-      return { transactions, cursorFound: false, complete: true, stopReason: "history_end", pages };
+    if (truncated) {
+      return {
+        transactions,
+        cursorFound: false,
+        complete: false,
+        stopReason: "max_transactions",
+        pages,
+      };
     }
 
     if (seenOffsets.has(page.nextOffset)) {

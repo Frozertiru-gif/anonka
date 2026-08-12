@@ -1,5 +1,6 @@
 import { Api } from "telegram";
 import type { GiftEvent, GiftEventKind, GiftPeerType } from "../domain/commerce/gift-event.js";
+import { normalizeStarsAmount } from "./stars-amount.js";
 
 /**
  * Pure, deterministic Gift service-message parser.
@@ -196,7 +197,7 @@ export function parseGiftServiceAction(
       giftTitle,
       giftSlug,
       giftNum,
-      offerPriceStars: action.price.amount.toString(),
+      offerPrice: normalizeStarsAmount(action.price),
       offerAccepted: action.accepted ?? false,
       offerDeclined: action.declined ?? false,
       offerExpiresAt: new Date(action.expiresAt * 1000),
@@ -223,7 +224,7 @@ export function parseGiftServiceAction(
       giftTitle,
       giftSlug,
       giftNum,
-      offerPriceStars: action.price.amount.toString(),
+      offerPrice: normalizeStarsAmount(action.price),
       // Expired and explicit-declined are mutually exclusive outcomes.
       offerExpired: expired,
       offerDeclined: !expired,
@@ -241,6 +242,13 @@ function senderLabel(e: GiftEvent): string {
   if (e.senderFirstName) return e.senderFirstName;
   if (e.senderId) return `user:${e.senderId}`;
   return "Unknown";
+}
+
+/** Human-readable label for an offer price amount, honoring its asset. */
+function offerPriceLabel(e: GiftEvent): string {
+  if (!e.offerPrice) return "?";
+  const suffix = e.offerPrice.asset === "ton" ? "TON" : "Stars";
+  return `${e.offerPrice.decimal} ${suffix}`;
 }
 
 /** Build a human-readable text from an already-normalized GiftEvent. */
@@ -270,7 +278,7 @@ export function formatGiftEventText(e: GiftEvent): string {
     case "gift_offer_received": {
       const status = e.offerAccepted ? "accepted" : e.offerDeclined ? "declined" : "pending";
       let text = `[Gift Offer Received]\n`;
-      text += `Offer: ${e.offerPriceStars ?? "?"} Stars for your NFT "${e.giftTitle ?? "Gift"}"${
+      text += `Offer: ${offerPriceLabel(e)} for your NFT "${e.giftTitle ?? "Gift"}"${
         e.giftNum ? ` #${e.giftNum}` : ""
       }${e.giftSlug ? ` (slug: ${e.giftSlug})` : ""}\n`;
       text += `From: ${senderLabel(e)}\n`;
@@ -281,7 +289,7 @@ export function formatGiftEventText(e: GiftEvent): string {
     }
     case "gift_offer_declined": {
       let text = `[Gift Offer ${e.offerExpired ? "Expired" : "Declined"}]\n`;
-      text += `Your offer of ${e.offerPriceStars ?? "?"} Stars for NFT "${e.giftTitle ?? "Gift"}"${
+      text += `Your offer of ${offerPriceLabel(e)} for NFT "${e.giftTitle ?? "Gift"}"${
         e.giftNum ? ` #${e.giftNum}` : ""
       }${e.giftSlug ? ` (slug: ${e.giftSlug})` : ""} was ${
         e.offerExpired ? "expired" : "declined"
