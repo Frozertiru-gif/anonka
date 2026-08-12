@@ -1,0 +1,4 @@
+[submodule "teleton-agent"]
+	path = teleton-agent
+	url = https://github.com/TONresistor/teleton-agent.git
+	branch = main
