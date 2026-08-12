@@ -1,44 +1,90 @@
 /**
  * Structured GiftEvent extracted from Telegram service messages.
  * Used by Anonka commerce layer, not LLM agent tools.
+ *
+ * Sender semantics:
+ * - `fromAnonymous` = Telegram did NOT provide a sender peer for the Gift
+ *   (the authoritative sender primitive is absent). Identity is unknown.
+ * - `nameHidden` = the sender asked Telegram to hide their name when the
+ *   recipient displays the Gift in their profile. It is a DISPLAY/PRIVACY
+ *   flag and says NOTHING about whether the sender is known to us.
+ *
+ * The two are independent: a known sender may set nameHidden=true (we still
+ * know their id), and an anonymous Gift may or may not carry nameHidden.
  */
+export type GiftEventKind =
+  | "gift_received"
+  | "gift_unique"
+  | "gift_offer_received"
+  | "gift_offer_declined";
+
+export type GiftPeerType = "user" | "chat" | "channel";
 
 export interface GiftEvent {
-  /** Stable event key for deduplication: msgId from the service message. */
+  /** Deterministic dedup key, chat-scoped (see gift-parser.ts). */
   eventKey: string;
-  /** Chat ID where the event occurred. */
+  kind: GiftEventKind;
+  /** Chat where the service message arrived. */
   chatId: string;
-  /** Numeric sender ID (0 if unknown/anonymous). */
-  senderId: number;
+  /** Raw Telegram service message id. */
+  msgId: number;
+  receivedAt: Date;
+
+  // ── Sender identity (authoritative) ─────────────────────────────────────
+  /** Telegram provided no sender peer for the Gift. */
+  fromAnonymous: boolean;
+  /** Sender requested name-hiding for public profile display. */
+  nameHidden: boolean;
+  /** Stable decimal sender identity. Absent when fromAnonymous. */
+  senderId?: string;
+  senderPeerType?: GiftPeerType;
+  /** Display-only, resolved best-effort for known senders. */
   senderUsername?: string;
   senderFirstName?: string;
-  /** True when sender chose to hide their name (action.nameHidden). */
-  fromAnonymous: boolean;
-  /** Type discriminator. */
-  kind: "gift_received" | "gift_offer_received" | "gift_offer_declined";
-  /** Timestamp from the message. */
-  receivedAt: Date;
-  /** Raw message ID for correlation. */
-  msgId: number;
 
-  // gift_received
+  // ── Receiver (correlation primitive) ────────────────────────────────────
+  receiverId?: string;
+  receiverPeerType?: GiftPeerType;
+
+  // ── Gift identity ───────────────────────────────────────────────────────
+  /** Stable Telegram gift identity (StarGift.id / StarGiftUnique.giftId). */
+  giftId?: string;
+  /** Display title. Never used as a correlation key. */
   giftTitle?: string;
-  /** Star value as string (may be "?" if unknown/collectible). */
+  /** Collectible slug (StarGiftUnique only). */
+  giftSlug?: string;
+  /** Collectible number (StarGiftUnique only). */
+  giftNum?: number;
+  /** Star value, when the gift carries one (regular gifts / offers). */
   stars?: string;
+  convertStars?: string;
+  /** Optional message attached by the sender. */
   giftMessage?: string;
+
+  // ── Lifecycle flags (economically relevant) ─────────────────────────────
+  /** Refund was issued for this Gift — not a live economic event by itself. */
+  refunded: boolean;
+  converted?: boolean;
   upgraded?: boolean;
   canUpgrade?: boolean;
+  saved?: boolean;
+  prepaidUpgrade?: boolean;
+  upgradeSeparate?: boolean;
+  /** StarGiftUnique transferred flag. */
+  transferred?: boolean;
+  /** StarGiftUnique from-offer flag. */
+  fromOffer?: boolean;
+  upgradeMsgId?: number;
   upgradeStars?: string;
-  convertStars?: string;
+  savedId?: string;
+  giftMsgId?: number;
 
-  // gift_offer_received / gift_offer_declined
+  // ── Purchase offer fields ───────────────────────────────────────────────
   offerPriceStars?: string;
   offerAccepted?: boolean;
   offerDeclined?: boolean;
   offerExpired?: boolean;
   offerExpiresAt?: Date;
-  offerSlug?: string;
-  offerNum?: number;
 }
 
 /**
