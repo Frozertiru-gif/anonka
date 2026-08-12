@@ -10,23 +10,19 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files and SDK workspace (needed for workspace resolution)
+# Copy dependency files and SDK workspace (still required by the current legacy runtime)
 COPY package.json package-lock.json ./
 COPY packages/sdk/package.json packages/sdk/
 
 # Install all deps (including devDependencies for build + SDK workspace)
 RUN npm ci
 
-# Copy source, build configs, and full SDK source
+# Copy source, build configs, and SDK source
 COPY tsconfig.json tsup.config.ts ./
 COPY src/ src/
 COPY packages/ packages/
 
-# Copy frontend source and install its deps
-COPY web/ web/
-RUN cd web && npm ci
-
-# Build everything: SDK → backend (tsup) → frontend (vite)
+# Build SDK + backend only. The old WebUI frontend is not part of Anonka.
 RUN npm run build
 
 # ---- Runtime stage ----
@@ -62,9 +58,6 @@ VOLUME /data
 # Run as non-root
 RUN chown -R node:node /app
 USER node
-
-# WebUI port (when enabled)
-EXPOSE 7777
 
 ENTRYPOINT ["node", "dist/cli/index.js"]
 CMD ["start"]
