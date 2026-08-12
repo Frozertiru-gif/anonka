@@ -34,7 +34,7 @@ Creator
 5. генерирует в runtime в основном текст;
 6. фото/видео/video notes берет из заранее подготовленного Media Vault;
 7. поддерживает `DIRECT_SALE` и `PATRON`;
-8. Gifts/Stars подтверждает только code-side логикой;
+8. Gifts подтверждает только code-side логикой по самому Telegram GiftEvent; Stars history остаётся audit/ledger infrastructure;
 9. управляется через отдельного приватного Telegram Control Bot;
 10. по умолчанию использует одну общую LLM-конфигурацию для всех creator runtime;
 11. не содержит KYC, age verification, consent/approval workflow и аналогичной административной бюрократии;
@@ -219,7 +219,7 @@ MessageActionStarGiftPurchaseOfferDeclined
 payments.GetStarsTransactions
 ```
 
-Существующий parser/tool code превращаем из agent tools в обычные typed domain/infrastructure services.
+Существующий parser/tool code превращаем из agent tools в обычные typed domain/infrastructure services. GiftEvent является source of truth для attribution/profit; Stars transaction ingestion сохраняется как audit/ledger primitive, а не обязательный matcher.
 
 ## 3.6. Telegram media helpers
 
@@ -1640,7 +1640,7 @@ OfferIntent
 → reserve compatible unsent asset OR series
 → snapshot price
 → WAITING
-→ verified matched Gift
+→ confirmed Gift attribution
 → PAID
 → FULFILLING
 → FULFILLED
@@ -1664,71 +1664,112 @@ BLOCKED
 
 Для одного conversation максимум один активный `WAITING DIRECT_SALE` Offer.
 
-## 24.3. GiftEvent
+## 24.3. GiftEvent — source of truth
+
+Канонический входящий Gift берётся из Telegram service event:
 
 ```text
 GiftEvent
 ├── event_key
 ├── creator_id
-├── sender_peer_id NULL when unknown/anonymous
+├── chat_id / conversation context
+├── sender_peer_id NULL when Telegram не дал sender
 ├── gift_ref/id
-├── value_stars NULL when not reliable
+├── value_stars NULL when value cannot be trusted
 ├── received_at
 └── raw/debug snapshot
 ```
 
-## 24.4. Gift lifecycle
+Stars transaction history не требуется для обычного attribution и не используется как обязательное подтверждение подарка.
+
+## 24.4. Attribution и expectation
+
+Базовый flow:
 
 ```text
-DETECTED
-  │
-  ├── reliable sender/value/key → MATCHED → CONSUMED
-  │
-  └── insufficient data        → UNMATCHED
-                                  │
-                                  ├── reconciliation resolves → MATCHED
-                                  └── remains ambiguous       → manual/debug review
+incoming GiftEvent
+→ dedupe by event_key
+→ sender/value validation
+→ compare sender with current DM conversation user
+   OR explicit pending gift expectation
+
+match
+→ CONFIRMED
+→ credit profit exactly once
+→ fulfill expectation if it existed
+
+no sender / sender mismatch / no reliable value
+→ MANUAL_REVIEW
+→ Control Bot CONFIRM or REJECT
 ```
 
-`UNMATCHED` Gift никогда автоматически не переводит Offer в `PAID`.
+Правила:
 
-Особые причины UNMATCHED:
+- Gift от пользователя текущего DM → auto `CONFIRMED`;
+- Gift от explicit expected sender → auto `CONFIRMED`, expectation закрывается;
+- ожидали X, пришёл Y → `MANUAL_REVIEW` с expected/actual context;
+- sender отсутствует → `MANUAL_REVIEW`;
+- `nameHidden` сам по себе не делает sender неизвестным: это display/privacy flag;
+- Gift без пригодной стоимости → `MANUAL_REVIEW`, стоимость не выдумывается;
+- duplicate `event_key` не начисляет profit повторно;
+- Gift service message не отправляется в LLM как обычная customer реплика.
+
+## 24.5. Manual review через Control Bot
+
+`MANUAL_REVIEW` должен содержать минимум:
 
 ```text
-nameHidden / anonymous sender
-неполный peer mapping
-неполный value/correlation
-нет stable transaction key
+event_key
+creator_id/chat/conversation context
+actual sender, если известен
+expected sender, если был
+Gift id/title
+value, если известна
+reason
 ```
 
-## 24.5. Live event + reconciliation
+Действия владельца:
 
 ```text
-live MTProto Gift/service event
-        +
-startup/periodic Stars transaction reconciliation
-        ↓
-GiftService
+CONFIRM
+→ attribution accepted
+→ credit known profit once
+→ pending expectation для этого chat считается выполненной
+
+REJECT
+→ profit не начисляется
+→ pending expectation остаётся активной
 ```
 
-Reconciliation нужен для offline gaps и уточнения ambiguous live events.
+Если после ручного `CONFIRM` стоимость всё ещё неизвестна, система не должна выдумывать сумму; подтверждение attribution и денежное начисление должны оставаться различимыми состояниями в persistent Phase 5 implementation.
 
-Polling умеренный и идемпотентный.
+## 24.6. Stars history
 
-## 24.6. Gift matching
+`payments.GetStarsTransactions` и нормализованный Stars ledger сохраняются как infrastructure для:
+
+- audit/debug;
+- финансовой сверки;
+- offline diagnostics;
+- будущих задач, где ledger действительно нужен.
+
+Они **не участвуют в обычном Gift sender attribution** и не образуют обязательный periodic reconciliation pipeline.
+
+## 24.7. Offer payment binding
+
+Для DIRECT_SALE Gift может оплатить Offer только после подтверждённого attribution:
 
 ```text
 Offer.status == WAITING
-AND creator matches
-AND peer reliably matches
-AND value reliably satisfies offer.required_stars
+AND creator/conversation context matches
+AND confirmed Gift sender is the intended customer
+AND confirmed Gift value reliably satisfies offer.required_stars
 AND gift.event_key not consumed
 → PAID
 ```
 
-Один Gift → максимум один Offer.
+Один Gift → максимум один Offer. При сомнении — `MANUAL_REVIEW`, а не автоматический `PAID`.
 
-## 24.7. Fulfillment
+## 24.8. Fulfillment
 
 ```text
 PAID
@@ -1768,8 +1809,10 @@ media_rejected
 media_sent
 offer_created
 gift_detected
-gift_unmatched
-gift_matched
+gift_confirmed
+gift_manual_review
+gift_review_confirmed
+gift_review_rejected
 offer_paid
 offer_fulfilled
 admin_command
@@ -1999,9 +2042,9 @@ src/prompts/
 5. photo/video/video_note принимаются и отправляются;
 6. Vault media можно resend/copy без forward attribution;
 7. Vault history scan/reindex работает через CreatorWorker;
-8. реальный Gift даёт доступные sender/value/key данные;
-9. anonymous/nameHidden Gift edge case понятен;
-10. Stars transactions достаточны для reconciliation там, где возможно;
+8. реальный Gift event даёт sender/value/event key и доходит до code-side GiftLedger;
+9. `nameHidden` не ломает известный sender; неизвестный/сомнительный sender уходит в MANUAL_REVIEW;
+10. Stars transaction ingestion/normalization/pagination работает как audit/ledger primitive, без обязательного Gift reconciliation;
 11. manual outgoing можно надёжно отличать от programmatic outgoing;
 12. найден pre-send correlation primitive для используемых MTProto send methods;
 13. creator login/setup работает отдельно от normal worker runtime.
@@ -2074,12 +2117,13 @@ src/prompts/
 
 ## Phase 5 — commerce
 
-- typed GiftEvent;
-- Gift DETECTED/MATCHED/UNMATCHED/CONSUMED semantics;
-- real Gift fixtures;
-- Stars reconciliation;
+- persistent typed GiftEvent/GiftLedger state;
+- GiftEvent-based sender/value attribution;
+- pending gift expectation per conversation/chat where needed;
+- MANUAL_REVIEW + durable Control Bot CONFIRM/REJECT;
+- duplicate-Gift/profit idempotency;
+- Stars ledger retained for audit/diagnostics, not mandatory attribution;
 - Offer state machine;
-- GiftMatcher;
 - DIRECT_SALE;
 - PATRON;
 - asset/series fulfillment;
@@ -2136,10 +2180,13 @@ strict media tag parser
 MediaSelector avoids repeat when alternatives exist
 series ordered fulfillment
 invalid ChatDecision JSON → one repair → text-only fallback with no side effects
-duplicate Gift
-anonymous/nameHidden Gift remains UNMATCHED
-Gift reconciliation can resolve previously UNMATCHED event
-one WAITING direct-sale Offer per conversation
+duplicate Gift credits profit once
+Gift from current DM user auto-confirms
+Gift from expected sender auto-confirms and fulfills expectation
+sender mismatch / unknown sender → MANUAL_REVIEW
+nameHidden with known sender does not become anonymous
+manual CONFIRM/REJECT semantics are idempotent
+one confirmed Gift pays at most one Offer
 raw feed pruning does not remove canonical conversation history
 repeated worker crashes trigger backoff then ERROR instead of infinite restart
 Supervisor never writes creator.db directly
@@ -2271,10 +2318,10 @@ docs-sdk/
 39. media tags deterministic/manual;
 40. Control Bot long-lived callbacks переживают Supervisor restart;
 41. admin callbacks привязаны к allowlisted admin и single-use;
-42. Gifts идут через live event + reconciliation;
-43. GiftService поддерживает UNMATCHED;
-44. ambiguous/anonymous Gift не auto-pay Offer;
-45. Gift matching и fulfillment идемпотентны;
+42. Gifts идут через authoritative live GiftEvent, а не mandatory Stars reconciliation;
+43. совпадение sender с current conversation/expectation auto-confirms Gift;
+44. ambiguous/unknown/mismatched Gift идёт в MANUAL_REVIEW и не auto-pay Offer;
+45. Gift attribution, manual review, profit credit и fulfillment идемпотентны;
 46. Pino redaction и file-permission hardening сохранены;
 47. graceful lifecycle Teleton сохранён в CreatorWorker;
 48. Docker/CI quality gates сохранены после cleanup;
