@@ -154,10 +154,16 @@ export class GiftLedger {
     this.reviews.delete(action.eventKey);
 
     if (action.type === "REJECT") {
+      // REJECT does NOT clear the expectation — the owner still awaits a
+      // gift from the expected user.
       return { status: "REJECTED", eventKey: action.eventKey };
     }
 
-    // CONFIRM: credit profit exactly once.
+    // CONFIRM: manual confirmation fulfills any pending expectation for this
+    // chat (the owner has decided this review IS the expected gift).
+    this.expectations.delete(review.chatId);
+
+    // Credit profit exactly once.
     const alreadyCredited = this.credited.get(action.eventKey);
     if (alreadyCredited) {
       return { status: "CONFIRMED", eventKey: action.eventKey, profit: alreadyCredited };

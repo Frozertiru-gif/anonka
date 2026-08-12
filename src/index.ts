@@ -36,6 +36,11 @@ import { createLogger, initLoggerFromConfig } from "./utils/logger.js";
 import { AgentLifecycle } from "./agent/lifecycle.js";
 import { InlineRouter } from "./bot/inline-router.js";
 import { PluginRateLimiter } from "./bot/rate-limiter.js";
+import { GiftLedger } from "./domain/commerce/gift-ledger.js";
+import type { GiftDecision } from "./domain/commerce/gift-ledger.js";
+import type { GiftEvent } from "./domain/commerce/gift-event.js";
+import { createConversationSenderResolver } from "./telegram/gift-resolver.js";
+import { routeGiftMessage } from "./telegram/gift-routing.js";
 import type { WebUIServer } from "./webui/server.js";
 import type { ApiServer } from "./api/server.js";
 import { HeartbeatRunner } from "./heartbeat.js";
@@ -89,6 +94,10 @@ export class TeletonApp {
   private pluginHookRegistry = new HookRegistry();
   private disposeToolIndexSubscription: (() => void) | null = null;
   private acceptingMessages = false;
+  /** One GiftLedger per creator runtime: authoritative Gift profit attribution. */
+  private giftLedger: GiftLedger;
+  /** Integration seam: future Control Bot sinks pending gift reviews here. */
+  private giftReviewSink: ((decision: GiftDecision) => void) | null = null;
 
   private configPath: string;
 
@@ -223,6 +232,8 @@ export class TeletonApp {
       modulePermissions,
       this.toolRegistry
     );
+
+    this.giftLedger = new GiftLedger(createConversationSenderResolver());
   }
 
   /**
@@ -766,6 +777,13 @@ ${blue}  ┌──────────────────────�
   private async handleSingleMessage(message: TelegramMessage): Promise<void> {
     this.messagesProcessed++;
     try {
+      // Gift service messages are authoritative profit events — never route
+      // them through the LLM as if they were ordinary user messages.
+      if (message.giftEvent) {
+        this.handleGiftEvent(message.giftEvent);
+        return;
+      }
+
       // Check if this is a scheduled task (from self)
       const ownUserId = this.bridge.getOwnUserId();
       if (
@@ -842,6 +860,61 @@ ${blue}  ┌──────────────────────�
     } catch (error) {
       log.error({ err: error }, "Error handling message");
     }
+  }
+
+  /**
+   * Route an incoming GiftEvent through the GiftLedger.
+   *
+   * CONFIRMED gifts are logged as profit events. MANUAL_REVIEW gifts are
+   * forwarded to the gift review sink (future Control Bot) and never reach
+   * the LLM. IGNORED gifts (duplicates, refunds, offers) are logged.
+   */
+  private handleGiftEvent(event: GiftEvent): void {
+    const { decision } = routeGiftMessage({ giftEvent: event }, this.giftLedger, (d) => {
+      if (this.giftReviewSink) {
+        this.giftReviewSink(d);
+      }
+    });
+
+    if (!decision) return;
+
+    switch (decision.status) {
+      case "CONFIRMED":
+        log.info(
+          { eventKey: event.eventKey, stars: decision.profit.stars, source: decision.source },
+          "Gift profit confirmed"
+        );
+        break;
+      case "MANUAL_REVIEW":
+        log.info(
+          { eventKey: event.eventKey, reason: decision.review.reason },
+          "Gift needs manual review"
+        );
+        break;
+      case "IGNORED":
+        log.debug({ eventKey: event.eventKey, reason: decision.reason }, "Gift ignored");
+        break;
+    }
+  }
+
+  /** Integration seam for the future Control Bot: set a sink for gift decisions. */
+  setGiftReviewSink(sink: ((decision: GiftDecision) => void) | null): void {
+    this.giftReviewSink = sink;
+  }
+
+  /** Integration seam for the future Control Bot: list pending gift reviews. */
+  listGiftReviews() {
+    return this.giftLedger.listReviews();
+  }
+
+  /** Integration seam for the future Control Bot: apply a CONFIRM/REJECT decision. */
+  applyGiftReview(action: { type: "CONFIRM" | "REJECT"; eventKey: string }) {
+    return this.giftLedger.applyReview(action);
+  }
+
+  /** Integration seam for the future Control Bot: record an expected gift sender. */
+  expectGift(chatId: string, expectedSenderId: string): void {
+    this.giftLedger.expectGift(chatId, expectedSenderId);
   }
 
   /**
