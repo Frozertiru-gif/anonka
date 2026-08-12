@@ -10,17 +10,18 @@
 
 - [x] Архитектура зафиксирована в `docs/ARCHITECTURE.md`.
 - [x] Создан этот чек-лист.
+- [x] Добавлен `.gitignore` для `.env`, Telethon session и runtime SQLite-файлов.
 
 ## 1. Persistence foundation
 
-- [~] Добавить typed domain enums/models для conversation/message.
-- [ ] Добавить SQLite async connection manager.
-- [ ] Добавить versioned migrations.
-- [ ] Создать core tables: `conversations`, `messages`, `conversation_facts`, `conversation_summaries`, `events`, `runtime_config`, `app_state`.
-- [ ] Включить `WAL`, `foreign_keys`, `busy_timeout`.
-- [ ] Добавить `DATABASE_PATH` в config/.env.example.
-- [ ] Подключить инициализацию БД при старте приложения и корректное закрытие при shutdown.
-- [ ] Добавить `aiosqlite` dependency.
+- [x] Добавить typed domain enums/models для conversation/message.
+- [x] Добавить SQLite async connection manager.
+- [x] Добавить versioned migrations.
+- [x] Создать core tables: `conversations`, `messages`, `conversation_facts`, `conversation_summaries`, `events`, `runtime_config`, `app_state`.
+- [x] Включить `WAL`, `foreign_keys`, `busy_timeout`.
+- [x] Добавить `DATABASE_PATH` в config/.env.example.
+- [x] Подключить инициализацию БД при старте приложения и корректное закрытие при shutdown.
+- [x] Добавить `aiosqlite` dependency.
 
 ## 2. Provider-agnostic LLM
 
@@ -157,4 +158,4 @@
 
 | Этап | Статус | Commit | Что сделано |
 |---|---|---|---|
-| 1. Persistence foundation | в работе | — | Начат базовый слой хранения |
+| 1. Persistence foundation | готово | `a75189188f4f1e686d52c69a92f0fe6fb401ff44` | Domain enums/models, async SQLite, migration v1, core tables/indexes, WAL/FK/busy timeout, `DATABASE_PATH`, startup/shutdown wiring, `aiosqlite`, runtime secrets/data в `.gitignore` |
