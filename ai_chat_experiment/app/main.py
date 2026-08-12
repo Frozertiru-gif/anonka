@@ -6,6 +6,7 @@ from .config import ConfigError, get_settings
 from .constants import APP_LOGGER_NAME
 from .llm.grok_client import GrokClient
 from .logging_setup import setup_logging
+from .persistence import Database
 from .services.reply_service import ReplyService
 from .tg.client import build_client
 from .tg.handlers import register_handlers
@@ -27,6 +28,11 @@ async def _run_async() -> None:
         settings.xai_model,
     )
 
+    database = Database(settings.database_path)
+    await database.connect()
+    await database.migrate()
+    logger.info("SQLite ready: %s", settings.database_path)
+
     tg_client = build_client(settings)
     grok_client = GrokClient(settings)
     reply_service = ReplyService(settings, grok_client)
@@ -34,10 +40,13 @@ async def _run_async() -> None:
 
     register_handlers(tg_client, settings, reply_service, session_store)
 
-    await tg_client.start()
-    me = await tg_client.get_me()
-    logger.info("Telegram client connected as @%s", getattr(me, "username", "unknown"))
-    await tg_client.run_until_disconnected()
+    try:
+        await tg_client.start()
+        me = await tg_client.get_me()
+        logger.info("Telegram client connected as @%s", getattr(me, "username", "unknown"))
+        await tg_client.run_until_disconnected()
+    finally:
+        await database.close()
 
 
 def run_app() -> None:
