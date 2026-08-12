@@ -20,16 +20,23 @@ vi.mock("../offset-store.js", () => ({
 }));
 
 // Mock feed stores — must be classes (used with `new`)
+const feedMocks = vi.hoisted(() => ({
+  storeMessage: vi.fn(),
+  upsertChat: vi.fn(),
+  upsertUser: vi.fn(),
+  incrementMessageCount: vi.fn(),
+}));
+
 vi.mock("../../memory/feed/index.js", () => ({
   MessageStore: class {
-    storeMessage = vi.fn().mockResolvedValue(undefined);
+    storeMessage = feedMocks.storeMessage.mockResolvedValue(undefined);
   },
   ChatStore: class {
-    upsertChat = vi.fn();
+    upsertChat = feedMocks.upsertChat;
   },
   UserStore: class {
-    upsertUser = vi.fn();
-    incrementMessageCount = vi.fn();
+    upsertUser = feedMocks.upsertUser;
+    incrementMessageCount = feedMocks.incrementMessageCount;
   },
 }));
 
@@ -767,6 +774,74 @@ describe("MessageHandler", () => {
       await handler.handleMessage(makeMessage({ id: 101 }));
 
       expect(agent.processMessage).not.toHaveBeenCalled();
+    });
+
+    // ── Outgoing classification ────────────────────────────────────────────
+
+    it("isOutgoing=true with an unexpected senderId does NOT reach the agent", async () => {
+      const agent = makeAgent();
+      const { handler } = createHandler({ dm_policy: "open" }, { agent });
+      handler.setOwnUserId("222");
+
+      // senderId failed to resolve (0) but msg.out=true — must be blocked.
+      const ctx = handler.analyzeMessage(
+        makeMessage({ senderId: 0, isOutgoing: true, outgoingOrigin: "creator_manual" })
+      );
+      expect(ctx.shouldRespond).toBe(false);
+      expect(ctx.reason).toBe("Creator manual outgoing");
+
+      await handler.handleMessage(
+        makeMessage({ id: 301, senderId: 0, isOutgoing: true, outgoingOrigin: "creator_manual" })
+      );
+      expect(agent.processMessage).not.toHaveBeenCalled();
+    });
+
+    it("isOutgoing=true programmatic with mismatched senderId is blocked", async () => {
+      const agent = makeAgent();
+      const { handler } = createHandler({ dm_policy: "open" }, { agent });
+      handler.setOwnUserId("222");
+
+      const ctx = handler.analyzeMessage(
+        makeMessage({ senderId: 999, isOutgoing: true, outgoingOrigin: "programmatic" })
+      );
+      expect(ctx.shouldRespond).toBe(false);
+      expect(ctx.reason).toBe("Programmatic outgoing");
+    });
+
+    it("programmatic outgoing is stored in the legacy feed as isFromAgent=true", async () => {
+      const { handler } = createHandler({ dm_policy: "open" });
+      handler.setOwnUserId("222");
+
+      await handler.handleMessage(
+        makeMessage({ id: 302, senderId: 222, isOutgoing: true, outgoingOrigin: "programmatic" })
+      );
+
+      expect(feedMocks.storeMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ isFromAgent: true })
+      );
+    });
+
+    it("creator_manual outgoing is stored in the legacy feed as isFromAgent=false", async () => {
+      const { handler } = createHandler({ dm_policy: "open" });
+      handler.setOwnUserId("222");
+
+      await handler.handleMessage(
+        makeMessage({ id: 303, senderId: 222, isOutgoing: true, outgoingOrigin: "creator_manual" })
+      );
+
+      expect(feedMocks.storeMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ isFromAgent: false })
+      );
+    });
+
+    it("incoming customer message stays isFromAgent=false", async () => {
+      const { handler } = createHandler({ dm_policy: "open" });
+
+      await handler.handleMessage(makeMessage({ id: 304, senderId: 555 }));
+
+      expect(feedMocks.storeMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ isFromAgent: false })
+      );
     });
   });
 });

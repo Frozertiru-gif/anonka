@@ -5,27 +5,67 @@ export interface SentMessageResult {
   date: number;
 }
 
+export type SendFailureClass = "definite" | "ambiguous";
+
+/**
+ * Telegram RPC error codes where the request was definitively rejected
+ * BEFORE any message was created:
+ * - 303 migrate (must be repeated on another DC; not executed here);
+ * - 400 bad request / validation;
+ * - 401 unauthorized (session rejected);
+ * - 403 forbidden / permission;
+ * - 404 not found;
+ * - 406 auth-key;
+ * - 420 FLOOD (FLOOD_WAIT / SLOWMODE_WAIT — rejected before send).
+ */
+const DEFINITE_REJECTION_CODES = new Set([303, 400, 401, 403, 404, 406, 420]);
+
 /**
  * Definite vs ambiguous send failure.
  *
- * A Telegram RPC error means the server received and REJECTED the request —
- * the message was never sent, so the pending correlation can be dropped and
- * a retry may safely generate fresh state. FLOOD_WAIT is also definite
- * (server rejected; the message was not accepted), including the plain
- * "FLOOD_WAIT ... exceeds max" Error thrown by flood-retry.ts.
+ * "definite" = we are confident Telegram rejected the request and NO message
+ * was created. Only then may the pending correlation be dropped.
  *
- * Everything else (ECONNRESET, socket hang up, timeouts, transport errors)
- * is ambiguous: the request may have reached Telegram. The correlation must
- * be preserved and any retry must reuse the same random_id.
+ * "ambiguous" = we cannot prove the message was not accepted (5xx, INTERNAL*,
+ * TIMEOUT-like server errors, RANDOM_ID_DUPLICATE, transport/network errors,
+ * unknown errors). The correlation MUST be preserved and a retry must reuse
+ * the same random_id — a false "definite" would otherwise produce a duplicate
+ * message on retry.
+ *
+ * Conservative default: doubt → ambiguous.
  */
+export function classifySendFailure(error: unknown): SendFailureClass {
+  if (!(error instanceof errors.RPCError)) {
+    // Non-RPC errors: FLOOD_WAIT-shaped plain errors from flood-retry.ts are
+    // definite (server explicitly rejected); everything else is ambiguous.
+    const err = error as { seconds?: unknown; message?: unknown };
+    if (typeof err.seconds === "number") return "definite";
+    if (typeof err.message === "string" && err.message.startsWith("FLOOD_WAIT")) {
+      return "definite";
+    }
+    return "ambiguous";
+  }
+
+  // RANDOM_ID_DUPLICATE means "this random_id is already known" — the previous
+  // attempt may already have been accepted. Never treat it as definite.
+  if (error.errorMessage === "RANDOM_ID_DUPLICATE") return "ambiguous";
+
+  const code = error.code;
+
+  // Server-side / transient failures: cannot prove the message was not created.
+  // Includes positive 5xx and witnessed negative codes (-500, -503).
+  if (code !== undefined && (code >= 500 || code < 0)) return "ambiguous";
+
+  // Known client-side rejection codes: message was definitely not created.
+  if (code !== undefined && DEFINITE_REJECTION_CODES.has(code)) return "definite";
+
+  // Unknown or missing code: conservative default.
+  return "ambiguous";
+}
+
+/** Convenience wrapper: true only for proven rejection. */
 export function isDefiniteSendFailure(error: unknown): boolean {
-  if (error instanceof errors.RPCError) return true;
-
-  const err = error as { seconds?: unknown; message?: unknown };
-  if (typeof err.seconds === "number") return true;
-  if (typeof err.message === "string" && err.message.startsWith("FLOOD_WAIT")) return true;
-
-  return false;
+  return classifySendFailure(error) === "definite";
 }
 
 /**

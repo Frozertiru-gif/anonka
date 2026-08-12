@@ -24,10 +24,17 @@ export interface PendingSend {
   reservedAt: number;
   stateUpdatedAt: number;
   attempts: number;
+  /** True while an active send operation (upload → network → ack) owns this record. */
+  inFlight: boolean;
   lastError?: string;
 }
 
-/** A send that never reaches an acknowledgement within this window is dead. */
+/**
+ * Expiry for a RESERVED record that was abandoned before any network attempt.
+ * With reserve-before-send ordering, a RESERVED record should transition to
+ * SENDING within milliseconds; a record still RESERVED after this window is
+ * an abandoned logical send, safe to clean.
+ */
 const RESERVED_TTL_MS = 60_000;
 /** Keep acknowledged/observed records to dedupe replayed outgoing updates. */
 const OBSERVED_RETENTION_MS = 120_000;
@@ -80,6 +87,7 @@ export class OutgoingTracker {
       reservedAt: now,
       stateUpdatedAt: now,
       attempts: 0,
+      inFlight: false,
     });
     log.debug({ chatId, randomId: key, state: "RESERVED" }, "outgoing_reserved");
   }
@@ -90,6 +98,27 @@ export class OutgoingTracker {
     if (!record) return;
     record.state = "SENDING";
     record.attempts += 1;
+    record.stateUpdatedAt = Date.now();
+  }
+
+  /**
+   * Mark the start of the active send operation. While the record is
+   * inFlight, cleanupStale() must never expire it regardless of how long the
+   * operation takes (large uploads, long FLOOD_WAIT retries, slow networks).
+   * The operation must release it via endOperation() in all exit paths.
+   */
+  beginOperation(randomId: bigint): void {
+    const record = this.byRandomId.get(randomId.toString());
+    if (!record) return;
+    record.inFlight = true;
+    record.stateUpdatedAt = Date.now();
+  }
+
+  /** Release the active-operation guard. Called when the send settles. */
+  endOperation(randomId: bigint): void {
+    const record = this.byRandomId.get(randomId.toString());
+    if (!record) return;
+    record.inFlight = false;
     record.stateUpdatedAt = Date.now();
   }
 
@@ -248,20 +277,34 @@ export class OutgoingTracker {
     return this.byRandomId.get(randomId.toString());
   }
 
-  /** Expire stale records. Returns the number of records removed. */
+  /**
+   * Expire stale records. Returns the number of records removed.
+   *
+   * Invariants:
+   * - a record marked inFlight is NEVER expired (active send operation);
+   * - SENDING is not expired by wall-clock time: the only way out of SENDING
+   *   is success → ACKNOWLEDGED, definite error → removed, ambiguous error →
+   *   AMBIGUOUS. Cleanup works on abandoned RESERVED, AMBIGUOUS past its
+   *   window, and ACKNOWLEDGED/OBSERVED retention.
+   */
   cleanupStale(now: number = Date.now()): number {
     let removed = 0;
     for (const [key, record] of this.byRandomId) {
+      if (record.inFlight) continue;
+
       const age = now - record.stateUpdatedAt;
       let expired = false;
 
-      if (record.state === "RESERVED" || record.state === "SENDING") {
+      if (record.state === "RESERVED") {
         expired = age > RESERVED_TTL_MS;
       } else if (record.state === "AMBIGUOUS") {
         expired = age > AMBIGUOUS_TTL_MS;
-      } else {
+      } else if (record.state === "ACKNOWLEDGED" || record.state === "OBSERVED") {
         expired = age > OBSERVED_RETENTION_MS;
       }
+      // SENDING: never expired here — an in-flight send is either released
+      // by its own operation (all exit paths call endOperation) or the
+      // process died and the in-memory tracker is gone anyway.
 
       if (expired) {
         if (record.telegramMessageId !== undefined) {

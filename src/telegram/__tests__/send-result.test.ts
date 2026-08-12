@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { Api, errors } from "telegram";
 import { toLong } from "../../utils/gramjs-bigint";
 import {
+  classifySendFailure,
   extractMessageIdMappings,
   extractSentMessageResult,
   isDefiniteSendFailure,
@@ -124,26 +125,75 @@ describe("extractSentMessageResult", () => {
   });
 });
 
-describe("isDefiniteSendFailure", () => {
-  it("RPCError is definite", () => {
-    const request = new Api.messages.GetChats({});
-    const rpcError = new errors.RPCError("PEER_ID_INVALID", request, 400);
-    expect(isDefiniteSendFailure(rpcError)).toBe(true);
+describe("classifySendFailure", () => {
+  const request = new Api.messages.GetChats({});
+
+  function rpcError(message: string, code?: number): errors.RPCError {
+    return new errors.RPCError(message, request, code);
+  }
+
+  it("RPC 400 validation error → definite", () => {
+    expect(classifySendFailure(rpcError("PEER_ID_INVALID", 400))).toBe("definite");
+    expect(isDefiniteSendFailure(rpcError("PEER_ID_INVALID", 400))).toBe(true);
   });
 
-  it("FloodWaitError is definite", () => {
+  it("RPC 403 permission error → definite", () => {
+    expect(classifySendFailure(rpcError("CHAT_WRITE_FORBIDDEN", 403))).toBe("definite");
+  });
+
+  it("RPC 401 → definite", () => {
+    expect(classifySendFailure(rpcError("SESSION_REVOKED", 401))).toBe("definite");
+  });
+
+  it("RPC 420 FLOOD → definite", () => {
+    expect(classifySendFailure(rpcError("FLOOD_WAIT_10", 420))).toBe("definite");
+  });
+
+  it("RPC 303 migrate → definite (not executed on this DC)", () => {
+    expect(classifySendFailure(rpcError("PHONE_MIGRATE_5", 303))).toBe("definite");
+  });
+
+  it("RPC 500 → ambiguous", () => {
+    expect(classifySendFailure(rpcError("INTERNAL", 500))).toBe("ambiguous");
+  });
+
+  it("RPC 503 timeout → ambiguous", () => {
+    expect(classifySendFailure(rpcError("Timeout", 503))).toBe("ambiguous");
+  });
+
+  it("negative server code (-500) → ambiguous", () => {
+    expect(classifySendFailure(rpcError("INTERNAL", -500))).toBe("ambiguous");
+  });
+
+  it("INTERNAL server error without code → ambiguous", () => {
+    expect(classifySendFailure(rpcError("INTERNAL"))).toBe("ambiguous");
+  });
+
+  it("RANDOM_ID_DUPLICATE → ambiguous even with 500 code", () => {
+    expect(classifySendFailure(rpcError("RANDOM_ID_DUPLICATE", 500))).toBe("ambiguous");
+  });
+
+  it("unknown RPC code → ambiguous (conservative default)", () => {
+    expect(classifySendFailure(rpcError("SOMETHING_NEW", 418))).toBe("ambiguous");
+  });
+
+  it("FloodWaitError instance → definite", () => {
     const floodError = new errors.FloodWaitError({ capture: 5, request: undefined });
-    expect(isDefiniteSendFailure(floodError)).toBe(true);
+    expect(classifySendFailure(floodError)).toBe("definite");
   });
 
-  it("flood-retry's plain 'FLOOD_WAIT exceeds max' Error is definite", () => {
-    expect(isDefiniteSendFailure(new Error("FLOOD_WAIT 500s exceeds max 120s — aborting"))).toBe(
-      true
+  it("ECONNRESET → ambiguous", () => {
+    expect(classifySendFailure(new Error("ECONNRESET"))).toBe("ambiguous");
+  });
+
+  it("socket timeout → ambiguous", () => {
+    expect(classifySendFailure(new TypeError("socket hang up"))).toBe("ambiguous");
+    expect(classifySendFailure(new Error("network timeout"))).toBe("ambiguous");
+  });
+
+  it("flood-retry's plain 'FLOOD_WAIT exceeds max' Error → definite", () => {
+    expect(classifySendFailure(new Error("FLOOD_WAIT 500s exceeds max 120s — aborting"))).toBe(
+      "definite"
     );
-  });
-
-  it("network errors are ambiguous (not definite)", () => {
-    expect(isDefiniteSendFailure(new Error("ECONNRESET"))).toBe(false);
-    expect(isDefiniteSendFailure(new TypeError("socket hang up"))).toBe(false);
   });
 });

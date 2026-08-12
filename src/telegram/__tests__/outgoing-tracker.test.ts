@@ -173,14 +173,12 @@ describe("OutgoingTracker — exact correlation classification", () => {
     expect(tracker.observe("111", 100)).toBe("programmatic");
   });
 
-  it("cleanupStale expires RESERVED records but keeps bound ones", () => {
+  it("cleanupStale expires abandoned RESERVED records", () => {
     const tracker = newTracker();
     const now = Date.now();
 
     tracker.reserve("111", 10n);
-    tracker.markSending(10n);
-
-    // Simulate 61s of age by faking timestamps.
+    // Abandoned before any network attempt — simulate age by faking timestamps.
     const record = tracker.getByRandomId(10n);
     if (record) {
       record.stateUpdatedAt = now - 70_000;
@@ -188,6 +186,99 @@ describe("OutgoingTracker — exact correlation classification", () => {
 
     expect(tracker.cleanupStale(now)).toBe(1);
     expect(tracker.getByRandomId(10n)).toBeUndefined();
+  });
+
+  it("SENDING record is never expired by wall-clock TTL", () => {
+    const tracker = newTracker();
+    const now = Date.now();
+
+    tracker.reserve("111", 10n);
+    tracker.markSending(10n);
+    const record = tracker.getByRandomId(10n);
+    if (record) {
+      record.stateUpdatedAt = now - 1_000_000; // far past any TTL
+    }
+
+    expect(tracker.cleanupStale(now)).toBe(0);
+    expect(tracker.getByRandomId(10n)).toBeDefined();
+    expect(tracker.getByRandomId(10n)?.state).toBe("SENDING");
+  });
+
+  it("active inFlight record survives cleanup during a long operation", () => {
+    const tracker = newTracker();
+    const now = Date.now();
+
+    tracker.reserve("111", 10n);
+    tracker.beginOperation(10n);
+    tracker.markSending(10n);
+    const record = tracker.getByRandomId(10n);
+    if (record) {
+      record.stateUpdatedAt = now - 1_000_000;
+    }
+
+    expect(tracker.cleanupStale(now)).toBe(0);
+    expect(tracker.getByRandomId(10n)).toBeDefined();
+
+    // After the operation settles into AMBIGUOUS, TTL applies again.
+    tracker.endOperation(10n);
+    tracker.markAmbiguousFailure(10n, new Error("ECONNRESET"));
+    const ambiguous = tracker.getByRandomId(10n);
+    if (ambiguous) {
+      ambiguous.stateUpdatedAt = now - 400_000;
+    }
+    expect(tracker.cleanupStale(now)).toBe(1);
+    expect(tracker.getByRandomId(10n)).toBeUndefined();
+  });
+
+  it("AMBIGUOUS → retry with the SAME randomId transitions back to SENDING", () => {
+    const tracker = newTracker();
+
+    tracker.reserve("111", 10n);
+    tracker.markSending(10n);
+    tracker.markAmbiguousFailure(10n, new Error("ECONNRESET"));
+
+    const record = tracker.getByRandomId(10n);
+    expect(record?.state).toBe("AMBIGUOUS");
+    expect(record?.attempts).toBe(1);
+
+    // Retry of the same logical send: same record, same randomId.
+    tracker.markSending(10n);
+    expect(record?.state).toBe("SENDING");
+    expect(record?.attempts).toBe(2);
+
+    expect(tracker.acknowledge(10n, 100, "111")).toBe(true);
+    expect(tracker.observe("111", 100)).toBe("programmatic");
+    expect(tracker.pendingCount).toBe(1); // never created a second record
+  });
+
+  it("conflicting ack (R→100 then R→101) keeps the original binding", () => {
+    const tracker = newTracker();
+
+    tracker.reserve("111", 10n);
+    tracker.markSending(10n);
+    expect(tracker.acknowledge(10n, 100, "111")).toBe(true);
+
+    expect(tracker.acknowledge(10n, 101, "111")).toBe(false);
+    expect(tracker.observe("111", 100)).toBe("programmatic");
+    expect(tracker.observe("111", 101)).toBe("creator_manual");
+  });
+
+  it("unknown randomId acknowledgement is ignored and creates no record", () => {
+    const tracker = newTracker();
+
+    expect(tracker.acknowledge(999n, 500)).toBe(false);
+    expect(tracker.pendingCount).toBe(0);
+  });
+
+  it("acknowledge binds to the chatId of the existing reservation (no chatId arg)", () => {
+    const tracker = newTracker();
+
+    tracker.reserve("222", 10n);
+    tracker.markSending(10n);
+    // Raw UpdateMessageID handler has no chatId — binding uses the reserved one.
+    expect(tracker.acknowledge(10n, 100)).toBe(true);
+    expect(tracker.observe("222", 100)).toBe("programmatic");
+    expect(tracker.observe("111", 100)).toBe("creator_manual");
   });
 
   it("cleanupStale retains OBSERVED records within retention window", () => {

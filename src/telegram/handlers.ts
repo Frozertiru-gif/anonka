@@ -266,11 +266,13 @@ export class MessageHandler {
     }
 
     const ownSenderId = this.ownUserId ? Number(this.ownUserId) : undefined;
-    if (
-      ownSenderId !== undefined &&
-      Number.isFinite(ownSenderId) &&
-      message.senderId === ownSenderId
-    ) {
+    const senderIsSelf =
+      ownSenderId !== undefined && Number.isFinite(ownSenderId) && message.senderId === ownSenderId;
+
+    // msg.out=true is the authoritative transport signal for an outgoing
+    // message. Never let an outgoing event fall through to the agent as a
+    // "customer incoming" prompt, even when senderId failed to resolve.
+    if (message.isOutgoing === true || senderIsSelf) {
       // Phase 0: programmatic and creator_manual outgoing must NOT be
       // conflated into one anonymous "self" bucket. Neither triggers the
       // agent, but downstream conversation logic distinguishes them.
@@ -404,8 +406,10 @@ export class MessageHandler {
       `📨 [Handler] Received ${msgType} message ${message.id} from ${message.senderId} (mentions: ${message.mentionsMe})`
     );
 
-    // 1. Store incoming message to feed FIRST (even if we won't respond)
-    await this.storeTelegramMessage(message, false);
+    // 1. Store incoming message to feed FIRST (even if we won't respond).
+    // Legacy feed source classification: programmatic outgoing is recorded
+    // as isFromAgent=true; incoming customer and creator_manual stay false.
+    await this.storeTelegramMessage(message, message.outgoingOrigin === "programmatic");
 
     // 1b. Fire plugin onMessage hooks (fire-and-forget, errors caught per plugin)
     if (this.pluginMessageHooks.length > 0) {

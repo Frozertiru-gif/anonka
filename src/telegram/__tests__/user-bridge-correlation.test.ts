@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Api } from "telegram";
+import { Api, errors } from "telegram";
 import { toLong } from "../../utils/gramjs-bigint";
 import { outgoingTracker } from "../outgoing-tracker";
 
@@ -168,5 +168,209 @@ describe("GramJSUserBridge — outgoing correlation", () => {
     expect(await outgoingTracker.classifyOutgoing("222", 300, { waitMs: 20, pollMs: 5 })).toBe(
       "programmatic"
     );
+  });
+
+  it("ambiguous failure (ECONNRESET) keeps correlation; retry reuses the SAME randomId in the real MTProto request", async () => {
+    const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
+    let attempt = 0;
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) => {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error("ECONNRESET");
+      }
+      return makeUpdatesResult(options.randomId, 400);
+    });
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    // First attempt fails ambiguously.
+    await expect(bridge.sendMessage({ chatId: "222", text: "retry me" })).rejects.toThrow(
+      "ECONNRESET"
+    );
+
+    // The correlation survives with the SAME randomId.
+    expect(outgoingTracker.pendingCount).toBe(1);
+    const firstRandomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    const record = outgoingTracker.getByRandomId(firstRandomId);
+    expect(record).toBeDefined();
+    expect(record?.state).toBe("AMBIGUOUS");
+
+    // Retry-aware caller reuses the transport randomId.
+    const sent = await bridge.sendMessage({
+      chatId: "222",
+      text: "retry me",
+      transportRandomId: firstRandomId,
+    });
+
+    // The SECOND MTProto request carried the SAME random_id.
+    const secondRandomId = sendLowLevel.mock.calls[1][1].randomId as bigint;
+    expect(String(secondRandomId)).toBe(String(firstRandomId));
+
+    // No second tracker record was created.
+    expect(outgoingTracker.pendingCount).toBe(1);
+    expect(sent.randomId?.toString()).toBe(firstRandomId.toString());
+
+    expect(await outgoingTracker.classifyOutgoing("222", 400, { waitMs: 0 })).toBe("programmatic");
+  });
+
+  it("retry with an existing AMBIGUOUS record does not create a duplicate correlation", async () => {
+    const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockRejectedValueOnce(new Error("ECONNRESET"));
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) => {
+      return makeUpdatesResult(options.randomId, 500);
+    });
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect(bridge.sendMessage({ chatId: "222", text: "x" })).rejects.toThrow("ECONNRESET");
+    const randomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    expect(outgoingTracker.pendingCount).toBe(1);
+
+    await bridge.sendMessage({ chatId: "222", text: "x", transportRandomId: randomId });
+
+    expect(outgoingTracker.pendingCount).toBe(1);
+    const record = outgoingTracker.getByRandomId(randomId);
+    expect(record?.telegramMessageId).toBe(500);
+  });
+
+  it("RANDOM_ID_DUPLICATE keeps the correlation ambiguous (not deleted)", async () => {
+    const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockRejectedValue(
+      new errors.RPCError("RANDOM_ID_DUPLICATE", new Api.messages.GetChats({}), 500)
+    );
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect(bridge.sendMessage({ chatId: "222", text: "dup" })).rejects.toThrow();
+
+    // The correlation must survive — a previous attempt may have been accepted.
+    expect(outgoingTracker.pendingCount).toBe(1);
+    const randomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    const record = outgoingTracker.getByRandomId(randomId);
+    expect(record?.state).toBe("AMBIGUOUS");
+  });
+
+  it("RPC 500 does NOT destroy the correlation", async () => {
+    const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockRejectedValue(
+      new errors.RPCError("INTERNAL", new Api.messages.GetChats({}), 500)
+    );
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect(bridge.sendMessage({ chatId: "222", text: "500" })).rejects.toThrow();
+
+    expect(outgoingTracker.pendingCount).toBe(1);
+    const randomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    expect(outgoingTracker.getByRandomId(randomId)?.state).toBe("AMBIGUOUS");
+  });
+
+  it("definite RPC 400 removes the correlation", async () => {
+    const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockRejectedValue(
+      new errors.RPCError("PEER_ID_INVALID", new Api.messages.GetChats({}), 400)
+    );
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect(bridge.sendMessage({ chatId: "222", text: "invalid" })).rejects.toThrow();
+
+    expect(outgoingTracker.pendingCount).toBe(0);
+  });
+
+  it("media upload happens BEFORE reserve — no stale correlation during long upload", async () => {
+    const buildInputMedia = mockClient.buildInputMedia as ReturnType<typeof vi.fn>;
+    let releaseUpload: (() => void) | undefined;
+    buildInputMedia.mockImplementation(
+      () =>
+        new Promise<Api.TypeInputMedia>((resolve) => {
+          releaseUpload = () => resolve(new Api.InputMediaDice({ emoticon: "🎲" }));
+        })
+    );
+
+    const sendLowLevel = mockClient.sendMediaLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) => {
+      return makeUpdatesResult(options.randomId, 600);
+    });
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    const sendPromise = bridge.sendPhoto("222", Buffer.from("slow"));
+
+    // While the upload is in flight, no send correlation exists yet — it
+    // cannot go stale before the actual SendMedia.
+    expect(outgoingTracker.pendingCount).toBe(0);
+
+    releaseUpload?.();
+    const sent = await sendPromise;
+
+    expect(sent.id).toBe(600);
+    expect(outgoingTracker.pendingCount).toBe(1);
+    const requestRandomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    expect(outgoingTracker.getByRandomId(requestRandomId)).toBeDefined();
+  });
+
+  it("media retry with transportRandomId sends the SAME random_id", async () => {
+    const buildInputMedia = mockClient.buildInputMedia as ReturnType<typeof vi.fn>;
+    buildInputMedia.mockResolvedValue(new Api.InputMediaDice({ emoticon: "🎲" }));
+
+    const sendLowLevel = mockClient.sendMediaLowLevel as ReturnType<typeof vi.fn>;
+    let attempt = 0;
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) => {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error("socket closed");
+      }
+      return makeUpdatesResult(options.randomId, 700);
+    });
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect(bridge.sendDice("222")).rejects.toThrow("socket closed");
+
+    const firstRandomId = sendLowLevel.mock.calls[0][1].randomId as bigint;
+    expect(outgoingTracker.getByRandomId(firstRandomId)?.state).toBe("AMBIGUOUS");
+
+    const sent = await bridge.sendDice("222", undefined, firstRandomId);
+
+    const secondRandomId = sendLowLevel.mock.calls[1][1].randomId as bigint;
+    expect(String(secondRandomId)).toBe(String(firstRandomId));
+    expect(sent.id).toBe(700);
+    expect(outgoingTracker.pendingCount).toBe(1);
   });
 });
