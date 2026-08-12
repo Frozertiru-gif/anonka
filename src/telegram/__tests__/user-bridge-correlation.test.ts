@@ -21,6 +21,8 @@ const mockClient = {
   buildInputMedia: vi.fn(),
   forwardMessagesLowLevel: vi.fn(),
   getMessages: vi.fn(),
+  addServiceMessageHandler: vi.fn(),
+  getEntity: vi.fn(),
 };
 
 vi.mock("../client.js", () => {
@@ -36,6 +38,8 @@ vi.mock("../client.js", () => {
     buildInputMedia = mockClient.buildInputMedia;
     forwardMessagesLowLevel = mockClient.forwardMessagesLowLevel;
     getMessages = mockClient.getMessages;
+    addServiceMessageHandler = mockClient.addServiceMessageHandler;
+    getEntity = mockClient.getEntity;
   }
   return { TelegramUserClient: MockTelegramUserClient };
 });
@@ -372,5 +376,98 @@ describe("GramJSUserBridge — outgoing correlation", () => {
     expect(String(secondRandomId)).toBe(String(firstRandomId));
     expect(sent.id).toBe(700);
     expect(outgoingTracker.pendingCount).toBe(1);
+  });
+
+  it("O: anonymous gift does not leak sender identity through the outer message", async () => {
+    // A service message whose message-level sender is resolvable, but whose
+    // Gift action has NO fromId (truly anonymous). The outer TelegramMessage
+    // must not publish the resolvable sender as an authenticated Gift source.
+    const msgSender = new Api.PeerUser({ userId: toLong(123n) });
+    const msgPeer = new Api.PeerUser({ userId: toLong(222n) });
+
+    const gift = new Api.StarGift({
+      id: toLong(42n),
+      stars: toLong(50n),
+      convertStars: toLong(45n),
+      title: "Delicious Cake",
+      sticker: new Api.Document({ id: toLong(1n) }),
+    });
+
+    const serviceMsg = new Api.MessageService({
+      id: 10,
+      date: 1700000000,
+      fromId: msgSender,
+      peerId: msgPeer,
+      action: new Api.MessageActionStarGift({
+        gift,
+        fromId: undefined,
+        nameHidden: false,
+      }),
+    });
+
+    const handler = vi.fn();
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    bridge.onServiceMessage(handler);
+
+    const registered = (mockClient.addServiceMessageHandler as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    await registered(serviceMsg);
+
+    const message = handler.mock.calls[0][0] as import("../bridge-interface").TelegramMessage;
+    expect(message.giftEvent?.fromAnonymous).toBe(true);
+    expect(message.giftEvent?.senderId).toBeUndefined();
+    expect(message.senderId).toBe(0);
+    expect(message.senderUsername).toBeUndefined();
+    expect(message.senderFirstName).toBeUndefined();
+  });
+
+  it("O2: nameHidden=true with known sender keeps identity (no over-anonymization)", async () => {
+    const msgSender = new Api.PeerUser({ userId: toLong(123n) });
+    const msgPeer = new Api.PeerUser({ userId: toLong(222n) });
+
+    const gift = new Api.StarGift({
+      id: toLong(42n),
+      stars: toLong(50n),
+      convertStars: toLong(45n),
+      title: "Delicious Cake",
+      sticker: new Api.Document({ id: toLong(1n) }),
+    });
+
+    const serviceMsg = new Api.MessageService({
+      id: 11,
+      date: 1700000000,
+      fromId: msgSender,
+      peerId: msgPeer,
+      action: new Api.MessageActionStarGift({
+        gift,
+        fromId: msgSender,
+        nameHidden: true,
+      }),
+    });
+
+    const handler = vi.fn();
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    bridge.onServiceMessage(handler);
+
+    const registered = (mockClient.addServiceMessageHandler as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    await registered(serviceMsg);
+
+    const message = handler.mock.calls[0][0] as import("../bridge-interface").TelegramMessage;
+    expect(message.giftEvent?.fromAnonymous).toBe(false);
+    expect(message.giftEvent?.nameHidden).toBe(true);
+    expect(message.giftEvent?.senderId).toBe("123");
   });
 });

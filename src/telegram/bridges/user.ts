@@ -7,6 +7,7 @@ import { randomLong } from "../../utils/gramjs-bigint.js";
 import { classifyMedia } from "../bridge-interface.js";
 import { outgoingTracker } from "../outgoing-tracker.js";
 import { extractSentMessageResult, isDefiniteSendFailure } from "../send-result.js";
+import { formatGiftEventText, giftSenderPeer, parseGiftServiceAction } from "../gift-parser.js";
 import type {
   ITelegramBridge,
   TelegramMessage,
@@ -19,7 +20,7 @@ import type {
   BotInfo,
   ChatInfo,
 } from "../bridge-interface.js";
-import type { GiftEvent } from "../../domain/commerce/gift-event.js";
+import { logGiftEvent } from "../gift-log.js";
 
 export type { TelegramMessage, InlineButton, SendMessageOptions } from "../bridge-interface.js";
 
@@ -916,150 +917,90 @@ export class GramJSUserBridge implements ITelegramBridge {
     };
   }
 
+  /**
+   * Resolve display identity (username/firstName) for a known Gift sender
+   * peer. Timeout-guarded and non-fatal — display data is never a source of
+   * truth. Never called for anonymous gifts.
+   */
+  private async resolvePeerDisplay(
+    peer: Api.TypePeer
+  ): Promise<{ senderUsername?: string; senderFirstName?: string; isBot: boolean }> {
+    try {
+      const entity = await Promise.race([
+        this.client.getClient().getEntity(peer),
+        new Promise<undefined>((resolve) =>
+          setTimeout(() => resolve(undefined), SENDER_RESOLVE_TIMEOUT_MS)
+        ),
+      ]);
+
+      let senderUsername: string | undefined;
+      let senderFirstName: string | undefined;
+      let isBot = false;
+
+      if (entity) {
+        if ("username" in entity) {
+          senderUsername = entity.username ?? undefined;
+        }
+        if ("firstName" in entity) {
+          senderFirstName = entity.firstName ?? undefined;
+        }
+        if (entity instanceof Api.User) {
+          isBot = entity.bot ?? false;
+        }
+      }
+      return { senderUsername, senderFirstName, isBot };
+    } catch {
+      return { isBot: false };
+    }
+  }
+
   private async parseServiceMessage(msg: Api.MessageService): Promise<TelegramMessage | null> {
     const action = msg.action;
     if (!action) return null;
-
-    const isGiftAction =
-      action instanceof Api.MessageActionStarGiftPurchaseOffer ||
-      action instanceof Api.MessageActionStarGiftPurchaseOfferDeclined ||
-      action instanceof Api.MessageActionStarGift;
-    if (!isGiftAction) return null;
     if (msg.out) return null;
 
     const chatId = msg.chatId?.toString() ?? msg.peerId?.toString() ?? "unknown";
-    const senderIdBig = msg.senderId ? BigInt(msg.senderId.toString()) : BigInt(0);
-    const senderId = Number(senderIdBig);
     const timestamp = new Date(msg.date * 1000);
 
-    const { senderUsername, senderFirstName, isBot } = await this.resolveSender(msg);
+    // Authoritative, deterministic parse. Display text is built FROM this.
+    const giftEvent = parseGiftServiceAction(action, {
+      chatId,
+      msgId: msg.id,
+      receivedAt: timestamp,
+      msgSenderPeer: msg.fromId,
+      msgPeer: msg.peerId,
+    });
 
-    let text = "";
-    let giftEvent: GiftEvent | undefined;
+    if (!giftEvent) return null;
 
-    if (action instanceof Api.MessageActionStarGiftPurchaseOffer) {
-      const gift = action.gift;
-      const isUnique = gift instanceof Api.StarGiftUnique;
-      const title = gift.title || "Unknown Gift";
-      const slug = isUnique ? gift.slug : undefined;
-      const num = isUnique ? gift.num : undefined;
-      const priceStars = action.price.amount?.toString() || "?";
-      const status = action.accepted ? "accepted" : action.declined ? "declined" : "pending";
-      const expires = action.expiresAt
-        ? new Date(action.expiresAt * 1000).toISOString()
-        : "unknown";
-
-      text = `[Gift Offer Received]\n`;
-      giftEvent = {
-        eventKey: `offer:${msg.id}`,
-        chatId,
-        senderId,
-        senderUsername,
-        senderFirstName,
-        fromAnonymous: false,
-        kind: "gift_offer_received",
-        receivedAt: timestamp,
-        msgId: msg.id,
-        giftTitle: title,
-        offerPriceStars: priceStars,
-        offerAccepted: action.accepted,
-        offerDeclined: action.declined,
-        offerExpiresAt: action.expiresAt ? new Date(action.expiresAt * 1000) : undefined,
-        offerSlug: slug,
-        offerNum: num,
-      };
-
-      text += `Offer: ${priceStars} Stars for your NFT "${title}"${num ? ` #${num}` : ""}${slug ? ` (slug: ${slug})` : ""}\n`;
-      text += `From: ${senderUsername ? `@${senderUsername}` : senderFirstName || `user:${senderId}`}\n`;
-      text += `Expires: ${expires}\n`;
-      text += `Status: ${status}\n`;
-      text += `Message ID: ${msg.id} — use telegram_resolve_gift_offer(offerMsgId=${msg.id}) to accept or telegram_resolve_gift_offer(offerMsgId=${msg.id}, decline=true) to decline.`;
-
-      log.info(
-        `Gift offer received: ${priceStars} Stars for "${title}" from ${senderUsername || senderId}`
-      );
-    } else if (action instanceof Api.MessageActionStarGiftPurchaseOfferDeclined) {
-      const gift = action.gift;
-      const isUnique = gift instanceof Api.StarGiftUnique;
-      const title = gift.title || "Unknown Gift";
-      const slug = isUnique ? gift.slug : undefined;
-      const num = isUnique ? gift.num : undefined;
-      const priceStars = action.price.amount?.toString() || "?";
-      const reason = action.expired ? "expired" : "declined";
-      giftEvent = {
-        eventKey: `offer_declined:${msg.id}`,
-        chatId,
-        senderId,
-        senderUsername,
-        senderFirstName,
-        fromAnonymous: false,
-        kind: "gift_offer_declined",
-        receivedAt: timestamp,
-        msgId: msg.id,
-        giftTitle: title,
-        offerPriceStars: priceStars,
-        offerExpired: action.expired,
-        offerSlug: slug,
-        offerNum: num,
-      };
-
-      text = `[Gift Offer ${action.expired ? "Expired" : "Declined"}]\n`;
-      text += `Your offer of ${priceStars} Stars for NFT "${title}"${num ? ` #${num}` : ""}${slug ? ` (slug: ${slug})` : ""} was ${reason}.`;
-
-      log.info(`Gift offer ${reason}: ${priceStars} Stars for "${title}"`);
-    } else if (action instanceof Api.MessageActionStarGift) {
-      const gift = action.gift;
-      const title = gift.title || "Unknown Gift";
-      const stars = gift instanceof Api.StarGift ? gift.stars?.toString() || "?" : "?";
-      const giftMessage = action.message?.text || "";
-      const fromAnonymous = action.nameHidden ?? false;
-
-      text = `[Gift Received]\n`;
-      text += `Gift: "${title}" (${stars} Stars)${action.upgraded ? " [Upgraded to Collectible]" : ""}\n`;
-      text += `From: ${fromAnonymous ? "Anonymous" : senderUsername ? `@${senderUsername}` : senderFirstName || `user:${senderId}`}\n`;
-      if (giftMessage) text += `Message: "${giftMessage}"\n`;
-      if (action.canUpgrade && action.upgradeStars) {
-        text += `This gift can be upgraded to a collectible for ${action.upgradeStars.toString()} Stars.\n`;
+    // Resolve display identity only for KNOWN senders. An anonymous gift's
+    // sender identity must never be resolved or published.
+    let isBot = false;
+    if (!giftEvent.fromAnonymous) {
+      const senderPeer = giftSenderPeer(action, msg.fromId);
+      if (senderPeer) {
+        const display = await this.resolvePeerDisplay(senderPeer);
+        giftEvent.senderUsername = display.senderUsername;
+        giftEvent.senderFirstName = display.senderFirstName;
+        isBot = display.isBot;
       }
-      if (action.convertStars) {
-        text += `Can be converted to ${action.convertStars.toString()} Stars.`;
-      }
-
-      giftEvent = {
-        eventKey: `gift:${msg.id}`,
-        chatId,
-        senderId: fromAnonymous ? 0 : senderId,
-        senderUsername: fromAnonymous ? undefined : senderUsername,
-        senderFirstName: fromAnonymous ? undefined : senderFirstName,
-        fromAnonymous,
-        kind: "gift_received",
-        receivedAt: timestamp,
-        msgId: msg.id,
-        giftTitle: title,
-        stars,
-        giftMessage: giftMessage || undefined,
-        upgraded: action.upgraded,
-        canUpgrade: action.canUpgrade,
-        upgradeStars: action.upgradeStars?.toString(),
-        convertStars: action.convertStars?.toString(),
-      };
-
-      log.info(
-        `Gift received: "${title}" (${stars} Stars) from ${fromAnonymous ? "Anonymous" : senderUsername || senderId}`
-      );
     }
 
-    if (!text) return null;
-
     if (msg.peerId) this.cachePeer(chatId, msg.peerId);
+
+    logGiftEvent(giftEvent);
+
+    // Outer message identity: anonymous gifts must not leak a resolved sender.
+    // senderId is a legacy number field; the canonical identity is GiftEvent.senderId.
+    const senderId = giftEvent.senderId !== undefined ? Number(giftEvent.senderId) : 0;
 
     return {
       id: msg.id,
       chatId,
       senderId,
-      senderUsername,
-      senderFirstName,
-      text: text.trim(),
+      senderUsername: giftEvent.fromAnonymous ? undefined : giftEvent.senderUsername,
+      senderFirstName: giftEvent.fromAnonymous ? undefined : giftEvent.senderFirstName,
+      text: formatGiftEventText(giftEvent),
       isGroup: false,
       isChannel: false,
       isBot,
