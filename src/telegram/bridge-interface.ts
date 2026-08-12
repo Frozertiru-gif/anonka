@@ -1,4 +1,5 @@
 import type { Api } from "telegram";
+import type { GiftEvent } from "../domain/commerce/gift-event.js";
 
 export interface TelegramMessage {
   id: number;
@@ -15,9 +16,20 @@ export interface TelegramMessage {
   timestamp: Date;
   _rawPeer?: Api.TypePeer;
   hasMedia: boolean;
-  mediaType?: "photo" | "document" | "video" | "audio" | "voice" | "sticker";
+  mediaType?: "photo" | "document" | "video" | "audio" | "voice" | "sticker" | "video_note";
   replyToId?: number;
   _rawMessage?: Api.Message;
+  isEdited?: boolean;
+  buttons?: ParsedButton[][];
+  /** Structured gift data, populated for service messages (gift events). */
+  giftEvent?: GiftEvent;
+}
+
+export interface ParsedButton {
+  text: string;
+  data?: Buffer;
+  command?: string;
+  type: "callback" | "command" | "url" | "switch_inline" | "unknown";
 }
 
 type MediaType = NonNullable<TelegramMessage["mediaType"]>;
@@ -27,11 +39,19 @@ type MediaType = NonNullable<TelegramMessage["mediaType"]>;
  * (GramJS user, grammy bot) which extract the flags from their own message shapes.
  * A message carries at most one media kind, so the check order is arbitrary.
  */
-export function classifyMedia(present: Record<MediaType, unknown>): {
+export function classifyMedia(present: Record<string, unknown>): {
   hasMedia: boolean;
   mediaType?: MediaType;
 } {
-  const order: MediaType[] = ["photo", "video", "audio", "voice", "sticker", "document"];
+  const order: MediaType[] = [
+    "photo",
+    "video",
+    "audio",
+    "voice",
+    "sticker",
+    "video_note",
+    "document",
+  ];
   const mediaType = order.find((k) => present[k]);
   return { hasMedia: mediaType !== undefined, mediaType };
 }
@@ -52,6 +72,7 @@ export interface SentMessage {
   id: number;
   date: number;
   chatId: string;
+  randomId?: bigint;
 }
 
 export interface EditMessageOptions {
@@ -109,6 +130,30 @@ export interface ITelegramBridge {
     caption?: string,
     replyToId?: number
   ): Promise<SentMessage>;
+  sendVideo(
+    chatId: string,
+    video: string | Buffer,
+    opts?: {
+      caption?: string;
+      replyToId?: number;
+      duration?: number;
+      width?: number;
+      height?: number;
+    }
+  ): Promise<SentMessage>;
+  sendVideoNote(
+    chatId: string,
+    videoNote: string | Buffer,
+    opts?: { caption?: string; replyToId?: number; duration?: number }
+  ): Promise<SentMessage>;
+
+  // Media operations
+  /** Download media from a message, then resend it as a new message without forward attribution. */
+  copyMessage(fromChatId: string, toChatId: string, messageId: number): Promise<SentMessage>;
+
+  // Button interaction
+  /** Programmatically click an inline button on a message (for anon bot control). */
+  clickButton(chatId: string, messageId: number, button: ParsedButton): Promise<boolean>;
 
   // Actions
   setTyping(chatId: string): Promise<void>;
@@ -136,6 +181,10 @@ export interface ITelegramBridge {
 
   // Events
   onNewMessage(
+    handler: (msg: TelegramMessage) => void | Promise<void>,
+    filters?: { incoming?: boolean; outgoing?: boolean; chats?: string[] }
+  ): void;
+  onEditedMessage(
     handler: (msg: TelegramMessage) => void | Promise<void>,
     filters?: { incoming?: boolean; outgoing?: boolean; chats?: string[] }
   ): void;

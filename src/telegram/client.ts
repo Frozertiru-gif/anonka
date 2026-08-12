@@ -31,6 +31,15 @@ export interface TelegramClientConfig {
   retryDelay?: number;
   autoReconnect?: boolean;
   floodSleepThreshold?: number;
+  /** If false, connect() will NOT prompt on stdin when the session is missing/invalid. Default: true. */
+  interactive?: boolean;
+}
+
+export type AuthState = "uninitialized" | "connecting" | "ready" | "auth_required" | "error";
+
+export interface AuthStatus {
+  state: AuthState;
+  reason?: string;
 }
 
 export interface TelegramUser {
@@ -47,6 +56,7 @@ export class TelegramUserClient {
   private config: TelegramClientConfig;
   private connected = false;
   private me?: TelegramUser;
+  private authState: AuthState = "uninitialized";
 
   constructor(config: TelegramClientConfig) {
     this.config = config;
@@ -93,18 +103,35 @@ export class TelegramUserClient {
     }
   }
 
+  getAuthState(): AuthState {
+    return this.authState;
+  }
+
+  getAuthStatus(): AuthStatus {
+    return {
+      state: this.authState,
+      reason:
+        this.authState === "auth_required"
+          ? "Session missing, expired, or invalid. Run 'anonka creator login' to authenticate."
+          : undefined,
+    };
+  }
+
   async connect(): Promise<void> {
     if (this.connected) {
       log.info("Already connected");
       return;
     }
 
+    const interactive = this.config.interactive !== false; // default true
+
     try {
+      this.authState = "connecting";
       const hasSession = existsSync(this.config.sessionPath);
 
       if (hasSession) {
         await this.client.connect();
-      } else {
+      } else if (interactive) {
         log.info("Starting authentication flow...");
         const phone = this.config.phone || (await promptInput("Phone number: "));
 
@@ -119,14 +146,12 @@ export class TelegramUserClient {
           })
         );
 
-        // SentCodeSuccess means we're already authorized (e.g. session migration)
         if (sendResult instanceof Api.auth.SentCodeSuccess) {
           log.info("Authenticated (SentCodeSuccess)");
           this.saveSession();
         } else if (sendResult instanceof Api.auth.SentCode) {
           const phoneCodeHash = sendResult.phoneCodeHash;
 
-          // Detect Fragment SMS for anonymous numbers (+888)
           if (sendResult.type instanceof Api.auth.SentCodeTypeFragmentSms) {
             const url = sendResult.type.url;
             if (url) {
@@ -161,7 +186,6 @@ export class TelegramUserClient {
                   throw new Error("Authentication failed: too many invalid code attempts");
                 }
               } else if (errObj.errorMessage === "SESSION_PASSWORD_NEEDED") {
-                // 2FA required
                 const pwd = await promptInput("2FA password: ");
                 const { computeCheck } = await import("telegram/Password.js");
                 const srpResult = await this.client.invoke(new Api.account.GetPassword());
@@ -184,6 +208,11 @@ export class TelegramUserClient {
         } else {
           throw new Error("Unexpected auth response: payment required or unknown type");
         }
+      } else {
+        // Non-interactive mode: no session file, report AUTH_REQUIRED
+        this.authState = "auth_required";
+        log.warn("Session file not found and interactive auth is disabled — AUTH_REQUIRED");
+        return;
       }
 
       const me = (await this.client.getMe()) as Api.User;
@@ -197,8 +226,44 @@ export class TelegramUserClient {
       };
 
       this.connected = true;
+      this.authState = "ready";
     } catch (error) {
+      const errObj = error as Record<string, string>;
+
+      if (!interactive && this.authState !== "auth_required") {
+        // Non-interactive mode: session existed but failed to connect (expired/revoked)
+        this.authState = "auth_required";
+        log.warn(
+          { err: error },
+          "Session exists but connection failed in non-interactive mode — AUTH_REQUIRED"
+        );
+        try {
+          await this.client.disconnect();
+        } catch {
+          // best effort
+        }
+        return;
+      }
+
+      this.authState = "error";
       log.error({ err: error }, "Connection error");
+
+      // Preserve known auth-related error info
+      if (
+        errObj.errorMessage === "AUTH_KEY_UNREGISTERED" ||
+        errObj.errorMessage === "SESSION_REVOKED" ||
+        errObj.errorMessage === "SESSION_EXPIRED" ||
+        errObj.errorMessage === "AUTH_KEY_DUPLICATED"
+      ) {
+        if (!interactive) {
+          this.authState = "auth_required";
+          log.warn(
+            `Session invalid (${errObj.errorMessage}) in non-interactive mode — AUTH_REQUIRED`
+          );
+          return;
+        }
+      }
+
       throw error;
     }
   }
@@ -275,6 +340,28 @@ export class TelegramUserClient {
         update.className === "UpdateInlineBotCallbackQuery"
       ) {
         await handler(update);
+      }
+    });
+  }
+
+  addEditedMessageHandler(
+    handler: (event: { message: Api.Message; chatId: string }) => void | Promise<void>
+  ): void {
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises -- GramJS event handler accepts async
+    this.client.addEventHandler(async (update) => {
+      let msg: Api.Message | undefined;
+      let chatId = "unknown";
+
+      if (update instanceof Api.UpdateEditMessage) {
+        msg = update.message as Api.Message;
+        chatId = msg.chatId?.toString() ?? msg.peerId?.toString() ?? "unknown";
+      } else if (update instanceof Api.UpdateEditChannelMessage) {
+        msg = update.message as Api.Message;
+        chatId = msg.chatId?.toString() ?? msg.peerId?.toString() ?? "unknown";
+      }
+
+      if (msg) {
+        await handler({ message: msg, chatId });
       }
     });
   }

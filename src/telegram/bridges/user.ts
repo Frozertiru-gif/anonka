@@ -5,10 +5,12 @@ import { createLogger } from "../../utils/logger.js";
 import { withFloodRetry } from "../flood-retry.js";
 import { randomLong } from "../../utils/gramjs-bigint.js";
 import { classifyMedia } from "../bridge-interface.js";
+import { outgoingTracker } from "../outgoing-tracker.js";
 import type {
   ITelegramBridge,
   TelegramMessage,
   InlineButton, // eslint-disable-line @typescript-eslint/no-unused-vars -- re-exported for backward compat
+  ParsedButton,
   SendMessageOptions,
   SentMessage,
   EditMessageOptions,
@@ -16,6 +18,7 @@ import type {
   BotInfo,
   ChatInfo,
 } from "../bridge-interface.js";
+import type { GiftEvent } from "../../domain/commerce/gift-event.js";
 
 export type { TelegramMessage, InlineButton, SendMessageOptions } from "../bridge-interface.js";
 
@@ -113,6 +116,8 @@ export class GramJSUserBridge implements ITelegramBridge {
   ): Promise<SentMessage> {
     try {
       const peer = options._rawPeer || this.peerCache.get(options.chatId) || options.chatId;
+      const randomId = randomLong();
+      outgoingTracker.record(options.chatId, randomId);
 
       let msg: Api.Message;
 
@@ -144,7 +149,7 @@ export class GramJSUserBridge implements ITelegramBridge {
         );
       }
 
-      return { id: msg.id, date: msg.date, chatId: options.chatId };
+      return { id: msg.id, date: msg.date, chatId: options.chatId, randomId };
     } catch (error) {
       log.error({ err: error }, "Error sending message");
       throw error;
@@ -293,15 +298,165 @@ export class GramJSUserBridge implements ITelegramBridge {
   ): Promise<SentMessage> {
     try {
       const gramJsClient = this.client.getClient();
+      const randomId = randomLong();
+      outgoingTracker.record(chatId, randomId);
+
       const result = await gramJsClient.sendFile(chatId, {
         file: photo,
         caption,
         replyTo: replyToId,
       });
-      return { id: result.id, date: result.date, chatId };
+      return { id: result.id, date: result.date, chatId, randomId };
     } catch (error) {
       log.error({ err: error }, "Error sending photo");
       throw error;
+    }
+  }
+
+  async sendVideo(
+    chatId: string,
+    video: string | Buffer,
+    opts?: {
+      caption?: string;
+      replyToId?: number;
+      duration?: number;
+      width?: number;
+      height?: number;
+    }
+  ): Promise<SentMessage> {
+    try {
+      const gramJsClient = this.client.getClient();
+      const randomId = randomLong();
+      outgoingTracker.record(chatId, randomId);
+
+      const result = await gramJsClient.sendFile(chatId, {
+        file: video,
+        caption: opts?.caption,
+        replyTo: opts?.replyToId,
+        forceDocument: false,
+        attributes: [
+          new Api.DocumentAttributeVideo({
+            roundMessage: false,
+            supportsStreaming: true,
+            duration: opts?.duration ?? 0,
+            w: opts?.width ?? 0,
+            h: opts?.height ?? 0,
+          }),
+        ],
+      });
+
+      return { id: result.id, date: result.date, chatId, randomId };
+    } catch (error) {
+      log.error({ err: error }, "Error sending video");
+      throw error;
+    }
+  }
+
+  async sendVideoNote(
+    chatId: string,
+    videoNote: string | Buffer,
+    opts?: { caption?: string; replyToId?: number; duration?: number }
+  ): Promise<SentMessage> {
+    try {
+      const gramJsClient = this.client.getClient();
+      const randomId = randomLong();
+      outgoingTracker.record(chatId, randomId);
+
+      const result = await withFloodRetry(
+        () =>
+          gramJsClient.sendFile(chatId, {
+            file: videoNote,
+            caption: opts?.caption,
+            replyTo: opts?.replyToId,
+            forceDocument: false,
+            attributes: [
+              new Api.DocumentAttributeVideo({
+                roundMessage: true,
+                duration: opts?.duration ?? 0,
+                w: 0,
+                h: 0,
+              }),
+            ],
+          }),
+        undefined,
+        undefined,
+        chatId
+      );
+
+      return { id: result.id, date: result.date, chatId, randomId };
+    } catch (error) {
+      log.error({ err: error }, "Error sending video note");
+      throw error;
+    }
+  }
+
+  async copyMessage(fromChatId: string, toChatId: string, messageId: number): Promise<SentMessage> {
+    try {
+      const gramJsClient = this.client.getClient();
+      const randomId = randomLong();
+      outgoingTracker.record(toChatId, randomId);
+
+      const messages = await gramJsClient.getMessages(fromChatId, { ids: [messageId] });
+      if (!messages || messages.length === 0 || !messages[0]) {
+        throw new Error(`Message ${messageId} not found in chat ${fromChatId}`);
+      }
+
+      const sourceMsg = messages[0];
+
+      if (!sourceMsg.media) {
+        const text = sourceMsg.message ?? "";
+        const msg = await this.sendMessage({ chatId: toChatId, text });
+        return { ...msg, randomId };
+      }
+
+      const buffer = await gramJsClient.downloadMedia(sourceMsg, {});
+      if (!buffer) {
+        throw new Error(`Failed to download media from message ${messageId}`);
+      }
+
+      const result = await gramJsClient.sendFile(toChatId, {
+        file: Buffer.isBuffer(buffer)
+          ? buffer
+          : typeof buffer === "string"
+            ? Buffer.from(buffer)
+            : Buffer.from(buffer as unknown as ArrayBuffer),
+        caption: sourceMsg.message ?? undefined,
+      });
+
+      return { id: result.id, date: result.date, chatId: toChatId, randomId };
+    } catch (error) {
+      log.error({ err: error }, "Error copying message");
+      throw error;
+    }
+  }
+
+  async clickButton(chatId: string, messageId: number, button: ParsedButton): Promise<boolean> {
+    try {
+      const gramJsClient = this.client.getClient();
+
+      if (button.type === "callback" && button.data) {
+        const peer = this.peerCache.get(chatId) || chatId;
+
+        await gramJsClient.invoke(
+          new Api.messages.GetBotCallbackAnswer({
+            peer,
+            msgId: messageId,
+            data: button.data,
+          })
+        );
+        return true;
+      }
+
+      if (button.type === "command" && button.command) {
+        await this.sendMessage({ chatId, text: button.command });
+        return true;
+      }
+
+      log.warn({ chatId, messageId, button }, "Unsupported button type for clickButton");
+      return false;
+    } catch (error) {
+      log.error({ err: error, chatId, messageId }, "Error clicking button");
+      return false;
     }
   }
 
@@ -446,6 +601,21 @@ export class GramJSUserBridge implements ITelegramBridge {
     );
   }
 
+  onEditedMessage(
+    handler: (message: TelegramMessage) => void | Promise<void>,
+    _filters?: {
+      incoming?: boolean;
+      outgoing?: boolean;
+      chats?: string[];
+    }
+  ): void {
+    this.client.addEditedMessageHandler(async (event) => {
+      const message = await this.parseMessage(event.message);
+      message.isEdited = true;
+      await handler(message);
+    });
+  }
+
   async fetchReplyContext(rawMsg: unknown): Promise<ReplyContext | null> {
     try {
       const msg = rawMsg as Api.Message;
@@ -486,6 +656,12 @@ export class GramJSUserBridge implements ITelegramBridge {
 
   getPeer(chatId: string): Api.TypePeer | undefined {
     return this.peerCache.get(chatId);
+  }
+
+  /** Check whether an outgoing message was sent programmatically (matched to a pending send). */
+  checkOutgoing(chatId: string): { programmatic: boolean; randomId?: bigint } {
+    const result = outgoingTracker.consumeByChat(chatId);
+    return { programmatic: result.matched, randomId: result.randomId };
   }
 
   // --- Non-interface methods (user-bridge specific) ---
@@ -555,6 +731,61 @@ export class GramJSUserBridge implements ITelegramBridge {
     return { senderUsername, senderFirstName, isBot };
   }
 
+  /** Extract structured buttons from a message's reply markup. */
+  private extractButtons(msg: Api.Message): ParsedButton[][] {
+    const markup = (msg as unknown as { replyMarkup?: Api.TypeReplyMarkup }).replyMarkup;
+    if (!markup) return [];
+
+    try {
+      if (markup instanceof Api.ReplyInlineMarkup) {
+        return markup.rows.map((row: Api.KeyboardButtonRow) =>
+          row.buttons.map((btn) => {
+            if (btn instanceof Api.KeyboardButtonCallback) {
+              return {
+                text: btn.text,
+                data: btn.data,
+                type: "callback" as const,
+              };
+            }
+            if (btn instanceof Api.KeyboardButtonUrl) {
+              return {
+                text: btn.text,
+                type: "url" as const,
+              };
+            }
+            if (btn instanceof Api.KeyboardButtonSwitchInline) {
+              return {
+                text: btn.text,
+                type: "switch_inline" as const,
+              };
+            }
+            return {
+              text: (btn as { text?: string }).text ?? "?",
+              type: "unknown" as const,
+            };
+          })
+        );
+      }
+
+      if (markup instanceof Api.ReplyKeyboardMarkup) {
+        return markup.rows.map((row: Api.KeyboardButtonRow) =>
+          row.buttons.map((btn) => {
+            const text = (btn as { text?: string }).text ?? "?";
+            return {
+              text,
+              command: text.startsWith("/") ? text : `/${text.toLowerCase().replace(/\s+/g, "_")}`,
+              type: "command" as const,
+            };
+          })
+        );
+      }
+
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
   private async parseMessage(msg: Api.Message): Promise<TelegramMessage> {
     const chatId = msg.chatId?.toString() ?? msg.peerId?.toString() ?? "unknown";
     const senderIdBig = msg.senderId ? BigInt(msg.senderId.toString()) : BigInt(0);
@@ -578,10 +809,13 @@ export class GramJSUserBridge implements ITelegramBridge {
       audio: msg.audio,
       voice: msg.voice,
       sticker: msg.sticker,
+      video_note: (msg as unknown as { videoNote?: unknown }).videoNote ?? msg.videoNote,
       document: msg.document,
     });
 
     const replyToMsgId = msg.replyToMsgId;
+
+    const buttons = this.extractButtons(msg);
 
     let text = msg.message ?? "";
     if (!text && msg.media) {
@@ -624,7 +858,9 @@ export class GramJSUserBridge implements ITelegramBridge {
       hasMedia,
       mediaType,
       replyToId: replyToMsgId,
-      _rawMessage: hasMedia || !!replyToMsgId ? msg : undefined,
+      buttons: buttons.length > 0 ? buttons : undefined,
+      isEdited: (msg as unknown as { editDate?: number }).editDate !== undefined,
+      _rawMessage: hasMedia || !!replyToMsgId || buttons.length > 0 ? msg : undefined,
     };
   }
 
@@ -637,16 +873,17 @@ export class GramJSUserBridge implements ITelegramBridge {
       action instanceof Api.MessageActionStarGiftPurchaseOfferDeclined ||
       action instanceof Api.MessageActionStarGift;
     if (!isGiftAction) return null;
-
     if (msg.out) return null;
 
     const chatId = msg.chatId?.toString() ?? msg.peerId?.toString() ?? "unknown";
     const senderIdBig = msg.senderId ? BigInt(msg.senderId.toString()) : BigInt(0);
     const senderId = Number(senderIdBig);
+    const timestamp = new Date(msg.date * 1000);
 
     const { senderUsername, senderFirstName, isBot } = await this.resolveSender(msg);
 
     let text = "";
+    let giftEvent: GiftEvent | undefined;
 
     if (action instanceof Api.MessageActionStarGiftPurchaseOffer) {
       const gift = action.gift;
@@ -661,6 +898,25 @@ export class GramJSUserBridge implements ITelegramBridge {
         : "unknown";
 
       text = `[Gift Offer Received]\n`;
+      giftEvent = {
+        eventKey: `offer:${msg.id}`,
+        chatId,
+        senderId,
+        senderUsername,
+        senderFirstName,
+        fromAnonymous: false,
+        kind: "gift_offer_received",
+        receivedAt: timestamp,
+        msgId: msg.id,
+        giftTitle: title,
+        offerPriceStars: priceStars,
+        offerAccepted: action.accepted,
+        offerDeclined: action.declined,
+        offerExpiresAt: action.expiresAt ? new Date(action.expiresAt * 1000) : undefined,
+        offerSlug: slug,
+        offerNum: num,
+      };
+
       text += `Offer: ${priceStars} Stars for your NFT "${title}"${num ? ` #${num}` : ""}${slug ? ` (slug: ${slug})` : ""}\n`;
       text += `From: ${senderUsername ? `@${senderUsername}` : senderFirstName || `user:${senderId}`}\n`;
       text += `Expires: ${expires}\n`;
@@ -678,6 +934,22 @@ export class GramJSUserBridge implements ITelegramBridge {
       const num = isUnique ? gift.num : undefined;
       const priceStars = action.price.amount?.toString() || "?";
       const reason = action.expired ? "expired" : "declined";
+      giftEvent = {
+        eventKey: `offer_declined:${msg.id}`,
+        chatId,
+        senderId,
+        senderUsername,
+        senderFirstName,
+        fromAnonymous: false,
+        kind: "gift_offer_declined",
+        receivedAt: timestamp,
+        msgId: msg.id,
+        giftTitle: title,
+        offerPriceStars: priceStars,
+        offerExpired: action.expired,
+        offerSlug: slug,
+        offerNum: num,
+      };
 
       text = `[Gift Offer ${action.expired ? "Expired" : "Declined"}]\n`;
       text += `Your offer of ${priceStars} Stars for NFT "${title}"${num ? ` #${num}` : ""}${slug ? ` (slug: ${slug})` : ""} was ${reason}.`;
@@ -688,7 +960,7 @@ export class GramJSUserBridge implements ITelegramBridge {
       const title = gift.title || "Unknown Gift";
       const stars = gift instanceof Api.StarGift ? gift.stars?.toString() || "?" : "?";
       const giftMessage = action.message?.text || "";
-      const fromAnonymous = action.nameHidden;
+      const fromAnonymous = action.nameHidden ?? false;
 
       text = `[Gift Received]\n`;
       text += `Gift: "${title}" (${stars} Stars)${action.upgraded ? " [Upgraded to Collectible]" : ""}\n`;
@@ -700,6 +972,25 @@ export class GramJSUserBridge implements ITelegramBridge {
       if (action.convertStars) {
         text += `Can be converted to ${action.convertStars.toString()} Stars.`;
       }
+
+      giftEvent = {
+        eventKey: `gift:${msg.id}`,
+        chatId,
+        senderId: fromAnonymous ? 0 : senderId,
+        senderUsername: fromAnonymous ? undefined : senderUsername,
+        senderFirstName: fromAnonymous ? undefined : senderFirstName,
+        fromAnonymous,
+        kind: "gift_received",
+        receivedAt: timestamp,
+        msgId: msg.id,
+        giftTitle: title,
+        stars,
+        giftMessage: giftMessage || undefined,
+        upgraded: action.upgraded,
+        canUpgrade: action.canUpgrade,
+        upgradeStars: action.upgradeStars?.toString(),
+        convertStars: action.convertStars?.toString(),
+      };
 
       log.info(
         `Gift received: "${title}" (${stars} Stars) from ${fromAnonymous ? "Anonymous" : senderUsername || senderId}`
@@ -721,9 +1012,10 @@ export class GramJSUserBridge implements ITelegramBridge {
       isChannel: false,
       isBot,
       mentionsMe: true,
-      timestamp: new Date(msg.date * 1000),
+      timestamp,
       hasMedia: false,
       _rawPeer: msg.peerId,
+      giftEvent,
     };
   }
 }

@@ -10,6 +10,7 @@ import type {
   BotInfo,
   ChatInfo,
   ReplyContext,
+  ParsedButton,
 } from "../bridge-interface.js";
 import type { TelegramMessage, InlineButton } from "../bridge.js";
 import { createLogger } from "../../utils/logger.js";
@@ -414,6 +415,47 @@ export class GrammyBotBridge implements ITelegramBridge {
     );
   }
 
+  async sendVideo(
+    _chatId: string,
+    _video: string | Buffer,
+    _opts?: {
+      caption?: string;
+      replyToId?: number;
+      duration?: number;
+      width?: number;
+      height?: number;
+    }
+  ): Promise<SentMessage> {
+    throw new Error("sendVideo is not implemented in bot mode.");
+  }
+
+  async sendVideoNote(
+    _chatId: string,
+    _videoNote: string | Buffer,
+    _opts?: { caption?: string; replyToId?: number; duration?: number }
+  ): Promise<SentMessage> {
+    throw new Error("sendVideoNote is not implemented in bot mode.");
+  }
+
+  async copyMessage(
+    _fromChatId: string,
+    _toChatId: string,
+    _messageId: number
+  ): Promise<SentMessage> {
+    throw new Error("copyMessage is not implemented in bot mode.");
+  }
+
+  async clickButton(_chatId: string, _messageId: number, _button: ParsedButton): Promise<boolean> {
+    return false; // Bot cannot click buttons in other chats
+  }
+
+  onEditedMessage(
+    _handler: (msg: TelegramMessage) => void | Promise<void>,
+    _filters?: { incoming?: boolean; outgoing?: boolean; chats?: string[] }
+  ): void {
+    // Bot API does not provide edited message events natively — no-op
+  }
+
   parseMessage(msg: GrammyMessage): TelegramMessage {
     const botUsername = this.botInfo?.username?.toLowerCase();
 
@@ -450,6 +492,7 @@ export class GrammyBotBridge implements ITelegramBridge {
       audio: msg.audio,
       voice: msg.voice,
       sticker: msg.sticker,
+      video_note: msg.video_note,
       document: msg.document,
     });
 
@@ -482,6 +525,7 @@ export class GrammyBotBridge implements ITelegramBridge {
         "message:text",
         "message:photo",
         "message:video",
+        "message:video_note",
         "message:voice",
         "message:document",
         "message:sticker",
