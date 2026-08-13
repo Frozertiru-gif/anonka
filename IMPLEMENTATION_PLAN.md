@@ -2,12 +2,14 @@
 
 > Статус: рабочий implementation plan.  
 > Этот файл отвечает на вопрос **что именно оставляем, что меняем, что переписываем с нуля и что удаляем**.  
-> Архитектурные решения не дублируются здесь как новый source of truth: при конфликте приоритет у [`ARCHITECTURE.md`](https://github.com/Frozertiru-gif/anonka/blob/main/ARCHITECTURE.md).  
+> Product behavior определяется [`PRODUCT_REQUIREMENTS.md`](https://github.com/Frozertiru-gif/anonka/blob/main/PRODUCT_REQUIREMENTS.md).  
+> Техническая архитектура определяется [`ARCHITECTURE.md`](https://github.com/Frozertiru-gif/anonka/blob/main/ARCHITECTURE.md).  
 > Правила для coding agents находятся в [`AGENTS.md`](https://github.com/Frozertiru-gif/anonka/blob/main/AGENTS.md).
 
 ## Ссылки
 
 - Проект: https://github.com/Frozertiru-gif/anonka
+- Product requirements: https://github.com/Frozertiru-gif/anonka/blob/main/PRODUCT_REQUIREMENTS.md
 - Архитектура: https://github.com/Frozertiru-gif/anonka/blob/main/ARCHITECTURE.md
 - Правила для агентов: https://github.com/Frozertiru-gif/anonka/blob/main/AGENTS.md
 - Текущий README: https://github.com/Frozertiru-gif/anonka/blob/main/README.md
@@ -26,7 +28,7 @@
 - Telegram user bridge;
 - Telegram Bot API bridge для Control Bot;
 - FloodWait/retry;
-- debounce;
+- debounce/queue mechanics;
 - transport offsets как watermark;
 - low-level media download/send primitives;
 - low-level Gifts parsing + Stars ledger/ingestion primitives;
@@ -36,7 +38,8 @@
 - graceful shutdown/lifecycle идеи;
 - file-permission hardening;
 - Docker multi-stage/non-root подход;
-- CI quality gates.
+- CI quality gates;
+- при наличии пригодных primitives — только низкоуровневые TON/wallet возможности, которые реально помогают принимать/проверять TON/USDT платежи.
 
 ## МЕНЯЕМ / ВЫНОСИМ ПОЛЕЗНОЕ
 
@@ -46,6 +49,7 @@
 - `src/memory/*`;
 - `src/soul/*`;
 - `src/agent/tools/telegram/*`;
+- TON/wallet код — только как потенциальный донор receive/verification primitives, не trading/business logic;
 - `src/sdk/telegram-utils.ts` и близкие transport helpers;
 - `src/app/provider-runtime.ts`;
 - старый CLI/doctor;
@@ -63,15 +67,20 @@
 - durable Inbox;
 - durable Outbox;
 - logical conversations;
+- conversation lifecycle `ACTIVE | INACTIVE | ARCHIVED`;
+- proactive follow-up scheduler;
+- relationship-manager AI contour;
 - Supervisor + CreatorWorker topology;
 - typed IPC;
 - AnonAdapter/AnonController;
+- anon search policy + active-capacity gating;
 - Control Bot application layer;
-- `AnonkaLLMService`;
+- dialogue `AnonkaLLMService`;
 - `ChatDecision` validation;
 - `AnonkaPromptBuilder`;
 - Media Vault index/catalog/selection;
 - Offer/Gift domain state machines;
+- crypto `PaymentExpectation` + incoming payment watcher/matching;
 - AI/HUMAN/HYBRID control;
 - recovery/idempotency layer;
 - Anonka-specific config schema;
@@ -79,10 +88,10 @@
 
 ## УДАЛЯЕМ после отвязки runtime
 
-- TON/wallet;
-- DEX/STON.fi/DeDust;
+- старый general-purpose TON/wallet agent stack, кроме извлечённых payment receive/verification primitives;
+- DEX/STON.fi/DeDust trading;
 - NFT/DNS/DeFi;
-- `src/ton-proxy/*`;
+- ненужный `src/ton-proxy/*` после extraction;
 - Gocoon;
 - MCP runtime;
 - general AgentRuntime autonomous loop;
@@ -91,11 +100,12 @@
 - plugin marketplace/hot reload;
 - backend WebUI;
 - Management API, если к моменту миграции не используется;
-- heartbeat autonomous tasks;
-- scheduled agent tasks;
+- **старый generic Teleton heartbeat/scheduled-agent runtime**;
 - vector embeddings/sqlite-vec;
 - old Teleton session/customer-memory pipeline;
 - SDK package и SDK-specific CI после извлечения действительно нужных transport helpers.
+
+Важно: удаление old heartbeat **не означает отказ от proactive messaging**. Для Anonka пишется отдельный event-driven follow-up scheduler. Аналогично удаление old wallet agent не означает отказ от узкого TON/USDT payment layer.
 
 ---
 
@@ -187,14 +197,16 @@ Telegram event
 → ConversationResolver
 → Debounce / ConversationQueue
 → ContextBuilder
-→ AnonkaLLMService
+→ Dialogue LLM contour
 → ChatDecision
 → DecisionValidator
-→ ResponseScheduler
+→ ResponseScheduler / proactive follow-up entry
 → ActionCoordinator
 → durable Outbox
 → Telegram
 ```
+
+Relationship-manager contour работает рядом с conversation domain и scheduler, но **не пишет customer-facing текст**.
 
 ### Новые файлы
 
@@ -204,6 +216,8 @@ Telegram event
 - `src/application/context-builder.ts`
 - `src/application/response-scheduler.ts`
 - `src/application/action-coordinator.ts`
+- `src/application/followup-scheduler.ts`
+- `src/llm/relationship-manager.ts`
 
 ### Фактическое состояние и безопасное переключение
 
@@ -286,11 +300,20 @@ creator-B/creator.db
 
 **ОСТАВИТЬ provider stack. НЕ писать свой HTTP/LLM client с нуля.**
 
-### Поверх него написать
+Поверх одной provider/model инфраструктуры работают две логические роли:
 
-- `src/llm/service.ts`;
+1. dialogue contour — формирует весь customer-facing текст и semantic intents;
+2. relationship-manager contour — lifecycle/next-action/follow-up decisions, без customer-facing wording.
+
+Это не требует двух разных физических моделей. По умолчанию обе роли могут использовать одну global LLM config с разными prompt/contracts.
+
+### Поверх provider stack написать
+
+- `src/llm/service.ts` — dialogue contour;
 - `src/llm/chat-decision.ts`;
-- `src/llm/decision-validator.ts`.
+- `src/llm/decision-validator.ts`;
+- `src/llm/relationship-manager.ts`;
+- отдельный typed manager decision contract/validator.
 
 ### Structured output MVP
 
@@ -299,12 +322,14 @@ prompt требует JSON
 → parse JSON
 → Zod validation
 → один repair call
-→ если снова invalid: text-only fallback
+→ если снова invalid: safe fallback
 ```
 
-Text-only fallback не имеет права запускать media/offer/handoff/payment side effects.
+Dialogue text-only fallback не имеет права запускать media/offer/handoff/payment side effects.
 
-`AnonkaLLMService` вызывает provider stack без `AgentRuntime`, generic tools, plugin/MCP/TON context и legacy transcript persistence. Из `src/soul/loader.ts` можно извлечь только безопасное чтение creator-файлов, cache и sanitization; старый Teleton system prompt и global MEMORY/USER/IDENTITY в customer path не входят.
+Manager invalid output не имеет права автоматически менять payment truth, архивировать критический paid flow либо создавать произвольные side effects; безопасный fallback — сохранить текущий lifecycle/не выполнять новое действие.
+
+Dialogue LLM вызывает provider stack без `AgentRuntime`, generic tools, plugin/MCP/trading context и legacy transcript persistence. Из `src/soul/loader.ts` можно извлечь только безопасное чтение creator-файлов, cache и sanitization; старый Teleton system prompt и global MEMORY/USER/IDENTITY в customer path не входят.
 
 ---
 
@@ -356,16 +381,18 @@ Text-only fallback не имеет права запускать media/offer/han
 
 - global MEMORY;
 - USER/IDENTITY;
-- heartbeat;
+- old generic heartbeat;
 - tool instructions;
 - owner-agent semantics;
 - frozen process-global customer memory.
 
 ### Написать
 
-- `AnonkaPromptBuilder`;
+- `AnonkaPromptBuilder` для dialogue contour;
+- manager prompt/contract отдельно;
 - creator-specific prompt loading;
-- runtime context/facts/summary/recent-message assembly.
+- runtime context/facts/summary/recent-message assembly;
+- follow-up context: why due, what changed since scheduling, known timing/schedule facts.
 
 ---
 
@@ -429,11 +456,24 @@ Text-only fallback не имеет права запускать media/offer/han
 
 - command set;
 - creator status UI;
-- conversation takeover;
+- anon search enabled/stop controls;
+- `max_active_conversations` setting;
+- search state `SEARCHING | PAUSED_CAPACITY | STOPPED_BY_ADMIN`;
+- lists/counts for `ACTIVE | INACTIVE | ARCHIVED`;
+- conversation takeover/control-mode actions;
 - media moderation UI;
 - runtime controls;
+- payment/review cards;
 - alerts;
 - callback storage.
+
+### Product boundary
+
+Control Bot — **не зеркало переписок**.
+
+Он показывает conversation metadata: peer/identity, lifecycle status, last activity, control mode, next follow-up, pending payment/review/error и т.п.
+
+Не делать обычный `/dialog <id>` интерфейсом чтения полного message body. Полную переписку владелец читает и пишет через Telegram user-account creator.
 
 Long-lived callbacks должны храниться в `supervisor.db`, а не только RAM.
 
@@ -459,7 +499,7 @@ Concrete `GramJSUserBridge` уже умеет отправку с сохранё
 
 **ПЕРЕПИСАТЬ ЦЕЛИКОМ.**
 
-Текущий `TeletonApp` связывает general AgentRuntime, tools, TON, MCP, plugins, WebUI/API, heartbeat, scheduled tasks и old memory lifecycle.
+Текущий `TeletonApp` связывает general AgentRuntime, tools, old TON stack, MCP, plugins, WebUI/API, heartbeat, scheduled tasks и old memory lifecycle.
 
 Целевой bootstrap:
 
@@ -585,12 +625,18 @@ src/domain/conversations/
 - `conversation_version`;
 - source `customer | creator_manual | programmatic`;
 - AI/HUMAN/HYBRID;
+- product lifecycle `ACTIVE | INACTIVE | ARCHIVED`;
+- `next_followup_at` / `followup_reason` / `waiting_for`;
 - facts;
 - rolling summary;
 - recent messages;
 - canonical `conversation_messages`.
 
 Telegram physical `chatId` не является conversation identity.
+
+`24h` inactivity может быть configurable fallback, но не единственным lifecycle rule. Quick completed sale может освободить active slot сразу; meaningful long-term contact может оставаться active дольше при явном контексте/следующем follow-up.
+
+Если известный человек из INACTIVE/ARCHIVED снова пишет, восстановить тот же conversation context/history, а не начинать знакомство с нуля.
 
 ---
 
@@ -613,6 +659,33 @@ HANDOFF_PENDING
 SKIPPING
 ```
 
+### Отдельная search policy
+
+У creator хранить/получать:
+
+```text
+anon_search_enabled
+max_active_conversations
+```
+
+Поверх low-level controller:
+
+```text
+search enabled + active_count < max
+→ разрешить/продолжить поиск
+
+active_count >= max
+→ PAUSED_CAPACITY
+
+capacity freed + search enabled
+→ resume
+
+admin stop
+→ STOPPED_BY_ADMIN и никакого auto-resume
+```
+
+Остановка поиска не завершает существующие conversations.
+
 ### Code-side only
 
 LLM не нажимает `next/search/stop/link` напрямую.
@@ -629,7 +702,7 @@ conversation_version
 
 ---
 
-## 4.7. `AnonkaLLMService`
+## 4.7. Dialogue `AnonkaLLMService`
 
 Создать:
 
@@ -639,21 +712,76 @@ src/llm/chat-decision.ts
 src/llm/decision-validator.ts
 ```
 
-LLM отвечает только за:
+Dialogue contour отвечает за весь customer-facing communication:
 
 - reply/no_reply;
+- exact customer-facing text;
+- tone/persona;
+- один или несколько natural messages;
 - semantic facts;
 - media intent;
 - offer intent;
 - soft gift ask;
 - handoff intent;
-- human-attention recommendation.
+- human-attention recommendation;
+- semantic signals для управляющего слоя: обещание написать позже, payment intent, known schedule/event, естественное завершение разговора и т.п.
 
-LLM не подтверждает деньги и не выбирает exact paid asset.
+Dialogue LLM не подтверждает деньги и не выбирает exact paid asset.
 
 ---
 
-## 4.8. Media Vault
+## 4.8. Relationship-manager contour + proactive scheduler
+
+Создать отдельный typed manager layer, например:
+
+```text
+src/llm/relationship-manager.ts
+src/domain/conversations/relationship-manager.ts
+src/application/followup-scheduler.ts
+```
+
+Manager **не пишет customer-facing текст**.
+
+Он решает:
+
+- ACTIVE/INACTIVE/ARCHIVED transitions/recommendations;
+- ждём ли customer response;
+- нужен ли future proactive contact;
+- когда `next_followup_at`;
+- reason/priority;
+- стоит ли вообще инициировать контакт при наступлении срока;
+- human-attention recommendation;
+- создать/обновить semantic payment expectation, если это явно следует из разговора.
+
+### Не делать global LLM polling
+
+Manager вызывается по событиям и due tasks:
+
+```text
+meaningful conversation change
+sale completion
+payment promise
+confirmed payment
+manual creator intervention
+next_followup_at due
+meaningful wait/deadline expired
+```
+
+При наступлении follow-up:
+
+```text
+cheap deterministic validity check
+→ stale/new-message/manual-intervention guard
+→ manager re-evaluation if needed
+→ dialogue contour composes actual text
+→ scheduler/Outbox sends
+```
+
+Incoming/manual messages должны отменять или пересчитывать stale follow-up.
+
+---
+
+## 4.9. Media Vault
 
 Создать новый domain/application слой:
 
@@ -686,12 +814,13 @@ Vision/LLM auto-tagging не делать.
 
 ---
 
-## 4.9. Commerce / Gifts
+## 4.10. Commerce / Gifts / Crypto
 
 Создать/довести:
 
 ```text
 src/domain/commerce/
+src/payments/
 ```
 
 ### Gift attribution
@@ -711,17 +840,66 @@ GiftEvent
 
 Stars transaction history не используется как обязательный Gift matcher. Она остаётся audit/ledger infrastructure.
 
-### Manual review
+### Crypto PaymentExpectation
 
-Control Bot должен уметь:
+Разговорный контур может извлечь semantic intent:
 
 ```text
-list pending reviews
-CONFIRM eventKey
-REJECT eventKey
+asset = TON|USDT
+amount/range
+when
+purpose = patron|offer|unknown
 ```
 
-`CONFIRM` принимает attribution, начисляет известный profit один раз и закрывает pending expectation для этого chat. `REJECT` profit не начисляет и expectation не закрывает.
+Application/manager layer создаёт durable expectation. LLM не подтверждает receipt.
+
+Минимально:
+
+```text
+creator_id
+conversation_id
+payment_method
+asset
+expected_amount / expected_range
+purpose
+expected_sender/wallet if known
+related_offer_id NULL
+created_at
+expires_at
+status
+```
+
+### Crypto watcher
+
+Не использовать LLM polling кошелька.
+
+Обычный adapter/watcher получает incoming wallet/blockchain/payment events через выбранный Wallet/TON API, webhook либо lightweight indexer polling.
+
+```text
+incoming crypto event
+→ normalize
+→ dedupe
+→ deterministic match pending expectations
+→ CONFIRMED | MANUAL_REVIEW
+```
+
+### Approximate amount
+
+Для PATRON/support допустим configurable tolerance, default candidate например `±5 USD equivalent`, если разговор действительно описывает приблизительную сумму.
+
+Пример: «около 25 USDT» → expectation может быть `20–30 USD equivalent`.
+
+Это только matching range. При нескольких подходящих candidates attribution не угадывать.
+
+### DIRECT_SALE
+
+Patron tolerance не является автоматической скидкой.
+
+Offer должен быть оплачен по negotiated/snapshotted price, кроме отдельного малого technical rounding tolerance. Если в разговоре реально согласовали новую цену, сначала обновляется price snapshot, потом новая сумма считается достаточной.
+
+### Manual review
+
+Control Bot должен уметь показывать pending Gift/crypto reviews и выполнять idempotent CONFIRM/REJECT там, где manual review разрешён domain contract.
 
 ### Offer states
 
@@ -735,7 +913,9 @@ EXPIRED
 BLOCKED
 ```
 
-DIRECT_SALE Offer переходит в `PAID` только после confirmed Gift attribution + reliable value/context. При сомнении — manual review.
+DIRECT_SALE Offer переходит в `PAID` только после confirmed payment attribution + reliable value/context. При сомнении — manual review.
+
+Один Gift/crypto payment event может оплатить максимум один Offer и не начисляет profit дважды.
 
 ### Paid fulfillment
 
@@ -743,7 +923,7 @@ DIRECT_SALE Offer переходит в `PAID` только после confirmed
 
 ---
 
-## 4.10. Config
+## 4.11. Config
 
 Текущие файлы/доки:
 
@@ -761,7 +941,8 @@ DIRECT_SALE Offer переходит в `PAID` только после confirmed
 - global LLM provider/model/base URL/key;
 - filesystem paths;
 - logging;
-- operational limits.
+- operational limits;
+- crypto payment provider/wallet/indexer secrets/config where applicable.
 
 ### Mutable DB state
 
@@ -770,7 +951,11 @@ DIRECT_SALE Offer переходит в `PAID` только после confirmed
 - commercial mode;
 - price;
 - offers/media toggles;
-- anon runtime state.
+- `anon_search_enabled`;
+- `max_active_conversations`;
+- anon runtime/search state;
+- fallback inactivity threshold;
+- payment feature toggles where needed.
 
 Control Bot не должен постоянно переписывать YAML.
 
@@ -780,16 +965,24 @@ Control Bot не должен постоянно переписывать YAML.
 
 Удалять только после отвязки от нового bootstrap и после извлечения полезных primitives.
 
-## 5.1. TON ecosystem
+## 5.1. Старый TON / wallet ecosystem
 
-Удалить:
+Удалить после extraction:
 
-- [`src/ton/`](https://github.com/Frozertiru-gif/anonka/tree/main/src/ton)
-- [`src/ton-proxy/`](https://github.com/Frozertiru-gif/anonka/tree/main/src/ton-proxy)
-- TON wallet/tools;
-- DEX/STON.fi/DeDust;
+- DEX/STON.fi/DeDust trading logic;
 - NFT/DNS/DeFi tooling;
-- TON-specific config/dependencies/tests/docs.
+- autonomous TON wallet agent/tools;
+- irrelevant TON business logic/config/tests/docs;
+- ненужные части `src/ton/` и `src/ton-proxy/`.
+
+### Перед удалением проверить и при необходимости извлечь
+
+- wallet/address primitives;
+- TON/USDT transfer normalization;
+- balance/transaction reading primitives;
+- безопасные helpers, которые реально уменьшают работу для receive/verification payment adapter.
+
+Не сохранять старый TON subsystem целиком только ради платежей. Целевая функция — узкий payment receive/verification layer.
 
 ## 5.2. General autonomous agent platform
 
@@ -831,15 +1024,15 @@ Frontend `web/` уже удалён.
 - WebUI logging stream;
 - WebUI/API dependencies/tests/config.
 
-## 5.6. Heartbeat / scheduled autonomous work
+## 5.6. Old heartbeat / scheduled autonomous work
 
 Удалить:
 
-- `heartbeat` general-agent behavior;
-- scheduled agent tasks;
-- соответствующие config/schema/tests.
+- старый generic Teleton `heartbeat` general-agent behavior;
+- старые scheduled agent tasks;
+- соответствующие generic config/schema/tests.
 
-Если позже понадобится расписание Anonka, сделать отдельный domain scheduler, а не сохранять old agent heartbeat.
+Но **не удалять product requirement на инициативное общение**. Вместо старого heartbeat реализовать отдельный Anonka event-driven `followup-scheduler`, который хранит конкретные due tasks и не сканирует все conversations через LLM.
 
 ## 5.7. Vector/RAG memory
 
@@ -927,7 +1120,7 @@ SDK как публичный Teleton product Anonka не нужен.
 5. TransportRouter.
 6. logical Conversation resolver.
 7. logical debounce/queue.
-8. `AnonkaLLMService`.
+8. dialogue `AnonkaLLMService`.
 9. `ChatDecision` + Zod validation/repair.
 10. ResponseScheduler.
 11. ActionCoordinator.
@@ -941,9 +1134,9 @@ Customer message больше не должен идти через старый
 
 ### Чёткие границы Phase 1
 
-В Phase 1 нужен минимальный logical `conversation_id`, creator-scoped mapping и version для queue/stale guards. Полные canonical `conversation_messages`, facts, summaries, creator manual history и anon → DM continuity остаются Phase 3.
+В Phase 1 нужен минимальный logical `conversation_id`, creator-scoped mapping и version для queue/stale guards. Полные canonical `conversation_messages`, facts, summaries, creator manual history, proactive relationship management и anon → DM continuity остаются Phase 3.
 
-Не включать сюда `SupervisorDatabase`, registry, OS-process isolation, IPC, Control Bot и crash-loop management: это Phase 2. Media Vault не переносится из transport spike в domain catalog до Phase 4; durable Gift/Offer state — до Phase 5.
+Не включать сюда `SupervisorDatabase`, registry, OS-process isolation, IPC, Control Bot и crash-loop management: это Phase 2. Media Vault не переносится из transport spike в domain catalog до Phase 4; durable Gifts/Offers/crypto payments — до Phase 5.
 
 ### Phase-1 test gates
 
@@ -979,10 +1172,14 @@ graceful drain finishes accepted Inbox/Outbox work
 9. non-interactive auth state.
 10. restart backoff/crash-loop protection.
 11. admin audit/alerts.
+12. owner `anon_search_enabled` toggle.
+13. `max_active_conversations` per creator.
+14. automatic `PAUSED_CAPACITY` / resume policy.
+15. Control Bot counts/lists `ACTIVE | INACTIVE | ARCHIVED` with metadata only, no full message-body viewer.
 
 ---
 
-## Phase 3 — conversation memory и handoff
+## Phase 3 — conversation memory, relationship management и handoff
 
 1. canonical `conversation_messages`.
 2. facts.
@@ -993,6 +1190,16 @@ graceful drain finishes accepted Inbox/Outbox work
 7. anonymous room identity.
 8. anon → DM same `conversation_id`.
 9. raw feed retention independent from canonical history.
+10. lifecycle `ACTIVE | INACTIVE | ARCHIVED`.
+11. reactivation of known inactive/archived person with preserved context.
+12. configurable inactivity fallback (например 24h), но не как единственный lifecycle rule.
+13. relationship-manager AI contour with typed decision/validation.
+14. `next_followup_at` / reason / waiting state.
+15. durable event-driven follow-up scheduler.
+16. due follow-up validity/stale checks.
+17. manager decides whether/when to initiate; dialogue contour always writes customer-facing text.
+18. cancel/recompute proactive follow-up after incoming customer/manual creator intervention.
+19. manager invocation only on meaningful events/due tasks, no periodic LLM scan of every conversation.
 
 ---
 
@@ -1012,7 +1219,7 @@ graceful drain finishes accepted Inbox/Outbox work
 
 ---
 
-## Phase 5 — Commerce
+## Phase 5 — Commerce: Gifts + crypto
 
 1. Persist normalized GiftEvent/GiftLedger state.
 2. GiftEvent-based sender/value attribution.
@@ -1025,6 +1232,15 @@ graceful drain finishes accepted Inbox/Outbox work
 9. PATRON.
 10. asset/series reservation.
 11. crash-safe paid fulfillment.
+12. durable generic `PaymentExpectation` abstraction for crypto promises from conversation context.
+13. TON/USDT incoming payment adapter/watcher.
+14. crypto transaction normalization/dedupe.
+15. deterministic matching using asset, amount/range, time, sender wallet/reference and related Offer where available.
+16. configurable approximate PATRON tolerance, default candidate ±5 USD-equivalent.
+17. DIRECT_SALE price rule separate from patron tolerance; underpayment does not auto-pay.
+18. ambiguous crypto match → MANUAL_REVIEW.
+19. one Gift/crypto payment event → at most one profit credit / one Offer consumption.
+20. confirmed crypto fact returned into conversation context for natural dialogue reaction.
 
 ---
 
@@ -1033,12 +1249,12 @@ graceful drain finishes accepted Inbox/Outbox work
 Только когда новый path покрыт test contracts:
 
 1. удалить old AgentRuntime customer path;
-2. удалить TON/DEX/NFT/DNS/DeFi;
+2. удалить old TON trading/DEX/NFT/DNS/DeFi/wallet-agent stack **после extraction нужных payment receive primitives**;
 3. удалить Gocoon;
 4. удалить MCP;
 5. удалить plugins;
 6. удалить backend WebUI/API;
-7. удалить heartbeat/scheduled agent tasks;
+7. удалить old generic heartbeat/scheduled agent tasks, сохранив новый Anonka follow-up scheduler;
 8. удалить vector/RAG memory;
 9. удалить old sessions/transcripts;
 10. удалить SDK package после extraction;
@@ -1062,7 +1278,7 @@ graceful drain finishes accepted Inbox/Outbox work
 
 Переписать под фактический Anonka runtime только после стабилизации интерфейсов/config.
 
-`ARCHITECTURE.md` при этом остаётся архитектурным source of truth, а этот файл — порядком реализации.
+`PRODUCT_REQUIREMENTS.md` остаётся source of truth для product behavior, `ARCHITECTURE.md` — для technical architecture, а этот файл — порядком реализации.
 
 ---
 
@@ -1097,6 +1313,24 @@ anon -> DM preserves conversation_id
 raw feed pruning cannot delete canonical history
 Supervisor does not write creator.db
 workers do not share DB/session/persona
+search enabled + free capacity -> anon search proceeds
+active capacity reached -> search pauses without disabling owner toggle
+capacity freed + owner toggle enabled -> search resumes
+admin stop -> search does not auto-resume
+quick completed sale can become INACTIVE immediately
+meaningful long-term contact can remain ACTIVE beyond fallback timeout
+inactive/archive customer returns -> existing context is restored
+Control Bot lists metadata without full customer message bodies
+manager schedules a single future follow-up without polling every conversation
+incoming/manual message invalidates stale follow-up
+follow-up due -> dialogue contour writes the actual customer text
+manager contour never writes customer-facing content
+crypto promise -> durable PaymentExpectation
+PATRON approximate crypto expectation can use configured ±5 USD-equivalent range
+DIRECT_SALE underpayment is not accepted by patron tolerance
+unambiguous crypto event -> one confirmed attribution
+ambiguous crypto event -> MANUAL_REVIEW
+one crypto payment cannot credit twice or pay two Offers
 ```
 
 До прохождения соответствующего gate нельзя удалять код, который остаётся единственным рабочим implementation нужной функции.
@@ -1108,8 +1342,9 @@ workers do not share DB/session/persona
 Перед любой задачей DeepSeek должен прочитать:
 
 1. [`AGENTS.md`](https://github.com/Frozertiru-gif/anonka/blob/main/AGENTS.md)
-2. [`ARCHITECTURE.md`](https://github.com/Frozertiru-gif/anonka/blob/main/ARCHITECTURE.md)
-3. этот `IMPLEMENTATION_PLAN.md`.
+2. [`PRODUCT_REQUIREMENTS.md`](https://github.com/Frozertiru-gif/anonka/blob/main/PRODUCT_REQUIREMENTS.md)
+3. [`ARCHITECTURE.md`](https://github.com/Frozertiru-gif/anonka/blob/main/ARCHITECTURE.md)
+4. этот `IMPLEMENTATION_PLAN.md`.
 
 Этот plan **не отменяет protected scope из `AGENTS.md`**.
 
@@ -1138,17 +1373,28 @@ DeepSeek читает protected code для контекста
 - anonymous physical chat отделён от logical conversation;
 - anon → DM сохраняет conversation identity;
 - AI/HUMAN/HYBRID работает со stale cancellation;
+- dialogue contour является единственным генератором customer-facing AI text;
+- relationship-manager contour event-driven управляет lifecycle/next follow-up и не пишет customer text;
+- proactive follow-up переживает restart и не требует LLM polling всех conversations;
+- ACTIVE/INACTIVE/ARCHIVED и creator active-capacity работают по `PRODUCT_REQUIREMENTS.md`;
+- anon search owner toggle, capacity pause и auto-resume работают независимо и предсказуемо;
+- Control Bot показывает operational metadata, но не дублирует полные customer messages;
 - Media Vault индексируется user-account worker-ом;
 - media tags deterministic/manual;
 - Gifts подтверждаются code-side по authoritative live GiftEvent;
 - sender match с current conversation/expectation auto-confirms Gift;
 - unknown/mismatched/ambiguous Gift идёт в MANUAL_REVIEW и не оплачивает Offer автоматически;
 - Stars history остаётся audit/ledger infrastructure, а не mandatory Gift reconciliation;
+- crypto PaymentExpectation создаётся из conversation intent, но receipt подтверждается только real payment event;
+- TON/USDT payment matching deterministic; ambiguity идёт в MANUAL_REVIEW;
+- approximate patron tolerance не превращается в скидку DIRECT_SALE;
 - paid fulfillment crash-safe;
 - Control Bot callbacks durable;
 - runtime auth не блокируется на stdin;
 - graceful shutdown drains accepted work;
-- old TON/MCP/plugins/WebUI/vector/SDK bloat удалён;
+- old trading/DeFi/NFT/general wallet-agent stack удалён, узкий payment layer сохранён/реализован;
+- old generic heartbeat удалён, Anonka-specific proactive scheduler сохранён;
+- old MCP/plugins/WebUI/vector/SDK bloat удалён;
 - package dependencies очищены;
 - Docker/CI сохраняют security/quality свойства;
 - README/config/deployment docs соответствуют фактическому runtime;
