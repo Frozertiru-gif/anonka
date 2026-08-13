@@ -144,6 +144,80 @@ describe("GramJSUserBridge — outgoing correlation", () => {
     expect(await outgoingTracker.classifyOutgoing("222", 200, { waitMs: 0 })).toBe("programmatic");
   });
 
+  it("Vault history scan paginates through the bounded requested history", async () => {
+    const first = new Api.Message({ id: 10, date: 100, message: "newer" });
+    const second = new Api.Message({ id: 9, date: 99, message: "older" });
+    const getMessages = mockClient.getMessages as ReturnType<typeof vi.fn>;
+    getMessages
+      .mockResolvedValueOnce([first])
+      .mockResolvedValueOnce([second])
+      .mockResolvedValueOnce([]);
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    const messages = await bridge.scanHistory("vault", { limit: 2, batchSize: 1 });
+
+    expect(messages.map((message) => message.id)).toEqual([10, 9]);
+    expect(getMessages).toHaveBeenNthCalledWith(1, "vault", { limit: 1, offsetId: 0 });
+    expect(getMessages).toHaveBeenNthCalledWith(2, "vault", { limit: 1, offsetId: 10 });
+  });
+
+  it("copyMessage reuploads a video note as a fresh video note", async () => {
+    const document = new Api.Document({
+      id: toLong(1),
+      accessHash: toLong(1),
+      fileReference: Buffer.alloc(0),
+      date: 1,
+      mimeType: "video/mp4",
+      size: toLong(1),
+      dcId: 1,
+      attributes: [
+        new Api.DocumentAttributeVideo({
+          duration: 5,
+          w: 480,
+          h: 480,
+          roundMessage: true,
+          supportsStreaming: false,
+        }),
+      ],
+    });
+    const source = new Api.Message({
+      id: 7,
+      date: 100,
+      message: "round",
+      media: new Api.MessageMediaDocument({ document }),
+    });
+    mockClient.getClient.mockReturnValue({
+      getMessages: vi.fn(async () => [source]),
+      downloadMedia: vi.fn(async () => Buffer.from("video")),
+    });
+    const buildInputMedia = mockClient.buildInputMedia as ReturnType<typeof vi.fn>;
+    buildInputMedia.mockResolvedValue(new Api.InputMediaDice({ emoticon: "🎲" }));
+    const sendLowLevel = mockClient.sendMediaLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) =>
+      makeUpdatesResult(options.randomId, 201)
+    );
+
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await bridge.copyMessage("vault", "dm", 7);
+
+    expect(buildInputMedia).toHaveBeenCalledWith(
+      expect.objectContaining({ file: Buffer.from("video"), videoNote: true, forceDocument: false })
+    );
+    expect(sendLowLevel.mock.calls[0][1]).not.toHaveProperty("fromPeer");
+  });
+
   it("sendMessage: manual outgoing in the same chat is NOT stolen by a pending send", async () => {
     const sendLowLevel = mockClient.sendMessageLowLevel as ReturnType<typeof vi.fn>;
     // The send is slow: resolve later so we can check pending state mid-flight.

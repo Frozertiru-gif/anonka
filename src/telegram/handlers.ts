@@ -60,6 +60,13 @@ export interface MessageContext {
   isAnonBot?: boolean;
 }
 
+/**
+ * Runtime boundary for normalized messages from the configured anonymous bot.
+ * Subscribers own protocol interpretation; MessageHandler never forwards these
+ * messages to the general-purpose AgentRuntime.
+ */
+export type AnonBotMessageSubscriber = (message: TelegramMessage) => Promise<void> | void;
+
 class RateLimiter {
   private messageTimestamps: number[] = [];
   private groupTimestamps: Map<string, number[]> = new Map();
@@ -195,6 +202,7 @@ export class MessageHandler {
   private db: Database.Database;
   private chatQueue: ChatQueue = new ChatQueue();
   private pluginMessageHooks: Array<(e: PluginMessageEvent) => Promise<void>> = [];
+  private anonBotMessageSubscribers = new Set<AnonBotMessageSubscriber>();
   private recentMessageIds: Set<string> = new Set();
   private static readonly DEDUP_MAX_SIZE = 500;
 
@@ -245,6 +253,15 @@ export class MessageHandler {
 
   setPluginMessageHooks(hooks: Array<(e: PluginMessageEvent) => Promise<void>>): void {
     this.pluginMessageHooks = hooks;
+  }
+
+  /**
+   * Subscribe to normalized messages from the configured anonymous-chat bot.
+   * Returns an unsubscribe function so a future AnonAdapter can own its lifecycle.
+   */
+  subscribeAnonBotMessages(subscriber: AnonBotMessageSubscriber): () => void {
+    this.anonBotMessageSubscribers.add(subscriber);
+    return () => this.anonBotMessageSubscribers.delete(subscriber);
   }
 
   async drain(): Promise<void> {
@@ -425,7 +442,18 @@ export class MessageHandler {
     // as isFromAgent=true; incoming customer and creator_manual stay false.
     await this.storeTelegramMessage(message, message.outgoingOrigin === "programmatic");
 
-    // 1b. Fire plugin onMessage hooks (fire-and-forget, errors caught per plugin)
+    // 1b. Configured anonymous-bot messages are a separate application route.
+    // They intentionally bypass plugin hooks and AgentRuntime; future AnonAdapter
+    // subscribers receive the normalized TelegramMessage exactly once per dedup key.
+    const context = this.analyzeMessage(message);
+    if (context.isAnonBot) {
+      for (const subscriber of this.anonBotMessageSubscribers) {
+        await subscriber(message);
+      }
+      return;
+    }
+
+    // 1c. Fire plugin onMessage hooks (fire-and-forget, errors caught per plugin)
     if (this.pluginMessageHooks.length > 0) {
       const event: PluginMessageEvent = {
         chatId: message.chatId,
@@ -448,7 +476,6 @@ export class MessageHandler {
     }
 
     // 2. Analyze context (before locking)
-    const context = this.analyzeMessage(message);
 
     // For groups: track pending messages even if we won't respond
     if (message.isGroup && !context.shouldRespond) {

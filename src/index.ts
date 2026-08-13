@@ -158,7 +158,7 @@ export class TeletonApp {
     return this.providerRuntime.stopGocoon();
   }
 
-  constructor(configPath?: string) {
+  constructor(configPath?: string, options: { creatorId?: string } = {}) {
     this.configPath = configPath ?? getDefaultConfigPath();
     this.config = loadConfig(this.configPath);
     this.providerRuntime = new ProviderRuntime(this.config);
@@ -180,7 +180,7 @@ export class TeletonApp {
 
     this.agent = new AgentRuntime(this.config, soul, this.toolRegistry);
 
-    this.bridge = createBridge(this.config);
+    this.bridge = createBridge(this.config, { creatorId: options.creatorId, interactive: false });
     this.heartbeatRunner = new HeartbeatRunner(this.agent, this.bridge, this.config);
     this.scheduledTaskHandler = new ScheduledTaskHandler(this.agent, this.bridge, this.config);
 
@@ -1104,10 +1104,13 @@ ${blue}  ┌──────────────────────�
 /**
  * Start the application
  */
-export async function main(configPath?: string): Promise<void> {
+export async function main(
+  configPath?: string,
+  options: { creatorId?: string } = {}
+): Promise<void> {
   let app: TeletonApp;
   try {
-    app = new TeletonApp(configPath);
+    app = new TeletonApp(configPath, options);
   } catch (error) {
     log.error(`Failed to initialize: ${getErrorMessage(error)}`);
     process.exit(1);

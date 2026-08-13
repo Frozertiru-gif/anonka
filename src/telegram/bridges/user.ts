@@ -19,6 +19,7 @@ import type {
   ReplyContext,
   BotInfo,
   ChatInfo,
+  HistoryScanOptions,
 } from "../bridge-interface.js";
 import { logGiftEvent } from "../gift-log.js";
 
@@ -124,6 +125,40 @@ export class GramJSUserBridge implements ITelegramBridge {
       log.error({ err: error }, "Error getting messages");
       return [];
     }
+  }
+
+  /**
+   * Read a bounded chat history in Telegram pages. This is deliberately just a
+   * transport primitive: Vault indexing and metadata policy stay above it.
+   */
+  async scanHistory(chatId: string, options: HistoryScanOptions = {}): Promise<TelegramMessage[]> {
+    const limit = Math.max(0, options.limit ?? 1000);
+    const batchSize = Math.max(1, Math.min(100, options.batchSize ?? 100));
+    const peer = this.peerCache.get(chatId) || chatId;
+    const parsed: TelegramMessage[] = [];
+    let offsetId = 0;
+
+    while (parsed.length < limit) {
+      const requestLimit = Math.min(batchSize, limit - parsed.length);
+      const page = await this.client.getMessages(peer, { limit: requestLimit, offsetId });
+      if (page.length === 0) break;
+
+      const results = await Promise.allSettled(page.map((message) => this.parseMessage(message)));
+      parsed.push(
+        ...results
+          .filter(
+            (result): result is PromiseFulfilledResult<TelegramMessage> =>
+              result.status === "fulfilled"
+          )
+          .map((result) => result.value)
+      );
+
+      const oldestId = page[page.length - 1]?.id;
+      if (page.length < requestLimit || oldestId === undefined || oldestId === offsetId) break;
+      offsetId = oldestId;
+    }
+
+    return parsed.slice(0, limit);
   }
 
   /**
@@ -481,13 +516,12 @@ export class GramJSUserBridge implements ITelegramBridge {
       throw new Error(`Failed to download media from message ${messageId}`);
     }
 
-    const media = await this.client.buildInputMedia({
-      file: Buffer.isBuffer(buffer)
-        ? buffer
-        : typeof buffer === "string"
-          ? Buffer.from(buffer)
-          : Buffer.from(buffer as unknown as ArrayBuffer),
-    });
+    const file = Buffer.isBuffer(buffer)
+      ? buffer
+      : typeof buffer === "string"
+        ? Buffer.from(buffer)
+        : Buffer.from(buffer as unknown as ArrayBuffer);
+    const media = await this.buildCopiedMedia(sourceMsg, file);
 
     const randomId = this.resolveTransportRandomId(toChatId, transportRandomId);
 
@@ -498,6 +532,40 @@ export class GramJSUserBridge implements ITelegramBridge {
         randomId,
       })
     );
+  }
+
+  /** Preserve Telegram video/video-note semantics while uploading a fresh copy. */
+  private async buildCopiedMedia(
+    sourceMsg: Api.Message,
+    file: Buffer
+  ): Promise<Api.TypeInputMedia> {
+    const document =
+      sourceMsg.media instanceof Api.MessageMediaDocument ? sourceMsg.media.document : undefined;
+    const videoAttribute =
+      document instanceof Api.Document
+        ? document.attributes.find((attribute) => attribute instanceof Api.DocumentAttributeVideo)
+        : undefined;
+
+    if (!(videoAttribute instanceof Api.DocumentAttributeVideo)) {
+      return this.client.buildInputMedia({ file });
+    }
+
+    return this.client.buildInputMedia({
+      file,
+      forceDocument: false,
+      videoNote: videoAttribute.roundMessage === true,
+      supportsStreaming:
+        videoAttribute.roundMessage !== true && videoAttribute.supportsStreaming === true,
+      attributes: [
+        new Api.DocumentAttributeVideo({
+          duration: videoAttribute.duration,
+          w: videoAttribute.w,
+          h: videoAttribute.h,
+          roundMessage: videoAttribute.roundMessage,
+          supportsStreaming: videoAttribute.supportsStreaming,
+        }),
+      ],
+    });
   }
 
   async clickButton(chatId: string, messageId: number, button: ParsedButton): Promise<boolean> {
@@ -811,12 +879,15 @@ export class GramJSUserBridge implements ITelegramBridge {
             if (btn instanceof Api.KeyboardButtonUrl) {
               return {
                 text: btn.text,
+                url: btn.url,
                 type: "url" as const,
               };
             }
             if (btn instanceof Api.KeyboardButtonSwitchInline) {
               return {
                 text: btn.text,
+                query: btn.query,
+                samePeer: btn.samePeer,
                 type: "switch_inline" as const,
               };
             }
@@ -839,9 +910,19 @@ export class GramJSUserBridge implements ITelegramBridge {
       if (markup instanceof Api.ReplyKeyboardMarkup) {
         return markup.rows.map((row: Api.KeyboardButtonRow) =>
           row.buttons.map((btn: Api.TypeKeyboardButton) => {
-            // A reply keyboard button is a text command: the button's literal
-            // text is what gets sent on tap. No "/" fabrication.
             const text = (btn as { text?: string }).text ?? "?";
+            if (!(btn instanceof Api.KeyboardButton)) {
+              // Request-phone/location/webview and other special reply buttons
+              // can have side effects. Preserve their visible label only; they
+              // must never be converted into a sendable command.
+              return {
+                text,
+                type: "unknown" as const,
+              };
+            }
+
+            // A plain reply keyboard button sends its literal text. No "/"
+            // fabrication and no inference for special button variants.
             return {
               text,
               command: text,

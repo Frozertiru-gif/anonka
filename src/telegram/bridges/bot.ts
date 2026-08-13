@@ -9,6 +9,7 @@ import type {
   EditMessageOptions,
   BotInfo,
   ChatInfo,
+  HistoryScanOptions,
   ReplyContext,
   ParsedButton,
 } from "../bridge-interface.js";
@@ -422,6 +423,12 @@ export class GrammyBotBridge implements ITelegramBridge {
   async getMessages(_chatId: string, _limit: number): Promise<TelegramMessage[]> {
     throw new Error(
       "getMessages is unavailable in bot mode — bots cannot read arbitrary chat history."
+    );
+  }
+
+  async scanHistory(_chatId: string, _options?: HistoryScanOptions): Promise<TelegramMessage[]> {
+    throw new Error(
+      "scanHistory is unavailable in bot mode — bots cannot read arbitrary chat history."
     );
   }
 

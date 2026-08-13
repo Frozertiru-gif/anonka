@@ -43,6 +43,18 @@ export interface AuthStatus {
   reason?: string;
 }
 
+/** Explicit worker-facing outcome; interactive setup belongs to creator login only. */
+export class TelegramAuthRequiredError extends Error {
+  readonly code = "AUTH_REQUIRED";
+
+  constructor() {
+    super(
+      "AUTH_REQUIRED: Telegram session is missing, expired, or invalid. Run 'anonka creator login <creator>'."
+    );
+    this.name = "TelegramAuthRequiredError";
+  }
+}
+
 export interface TelegramUser {
   id: bigint;
   username?: string;
@@ -213,7 +225,7 @@ export class TelegramUserClient {
         // Non-interactive mode: no session file, report AUTH_REQUIRED
         this.authState = "auth_required";
         log.warn("Session file not found and interactive auth is disabled — AUTH_REQUIRED");
-        return;
+        throw new TelegramAuthRequiredError();
       }
 
       const me = (await this.client.getMe()) as Api.User;
@@ -231,6 +243,10 @@ export class TelegramUserClient {
     } catch (error) {
       const errObj = error as Record<string, string>;
 
+      if (error instanceof TelegramAuthRequiredError) {
+        throw error;
+      }
+
       if (!interactive && this.authState !== "auth_required") {
         // Non-interactive mode: session existed but failed to connect (expired/revoked)
         this.authState = "auth_required";
@@ -243,7 +259,7 @@ export class TelegramUserClient {
         } catch {
           // best effort
         }
-        return;
+        throw new TelegramAuthRequiredError();
       }
 
       this.authState = "error";
@@ -261,7 +277,7 @@ export class TelegramUserClient {
           log.warn(
             `Session invalid (${errObj.errorMessage}) in non-interactive mode — AUTH_REQUIRED`
           );
-          return;
+          throw new TelegramAuthRequiredError();
         }
       }
 

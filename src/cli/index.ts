@@ -5,6 +5,7 @@ import { mcpAddCommand, mcpRemoveCommand, mcpListCommand } from "./commands/mcp.
 import { configCommand } from "./commands/config.js";
 import { apiRotateKeyCommand, apiFingerprintCommand } from "./commands/api.js";
 import { registerGocoonCommand } from "./commands/gocoon.js";
+import { creatorLoginCommand } from "./commands/creator.js";
 import { main as startApp } from "../index.js";
 import { configExists, getDefaultConfigPath } from "../config/loader.js";
 import { getErrorMessage } from "../utils/errors.js";
@@ -12,10 +13,7 @@ import { PACKAGE_VERSION } from "../utils/package-info.js";
 
 const program = new Command();
 
-program
-  .name("teleton")
-  .description("Teleton Agent - Personal AI Agent for Telegram")
-  .version(PACKAGE_VERSION);
+program.name("anonka").description("Anonka Telegram automation runtime").version(PACKAGE_VERSION);
 
 // Setup command
 program
@@ -63,6 +61,7 @@ program
   .option("--api", "Enable Management API server (overrides config)")
   .option("--api-port <port>", "Management API port (default: 7778)")
   .option("--json-credentials", "Output API credentials as JSON to stdout on start")
+  .option("--creator <id>", "Creator whose isolated Telegram session to use")
   .action(async (options) => {
     try {
       // If --api flag and no config: start API-only bootstrap mode
@@ -106,7 +105,22 @@ program
         process.env.TELETON_JSON_CREDENTIALS = "true";
       }
 
-      await startApp(options.config);
+      await startApp(options.config, { creatorId: options.creator });
+    } catch (error) {
+      console.error("Error:", getErrorMessage(error));
+      process.exit(1);
+    }
+  });
+
+const creator = program.command("creator").description("Manage isolated creator Telegram sessions");
+
+creator
+  .command("login <creator>")
+  .description("Interactively authenticate and save a creator's Telegram session")
+  .option("-c, --config <path>", "Config file path", getDefaultConfigPath())
+  .action(async (creatorId: string, options) => {
+    try {
+      await creatorLoginCommand(creatorId, options.config);
     } catch (error) {
       console.error("Error:", getErrorMessage(error));
       process.exit(1);

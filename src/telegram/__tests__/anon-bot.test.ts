@@ -66,7 +66,9 @@ function makeInlineButtons(): Api.ReplyInlineMarkup {
         ],
       }),
       new Api.KeyboardButtonRow({
-        buttons: [new Api.KeyboardButtonSwitchInline({ text: "Share", samePeer: true })],
+        buttons: [
+          new Api.KeyboardButtonSwitchInline({ text: "Share", query: "invite", samePeer: true }),
+        ],
       }),
     ],
   });
@@ -181,8 +183,60 @@ describe("anonymous bot transport primitives", () => {
       expect(msg.buttons).toHaveLength(2);
       expect(msg.buttons![0][0]).toMatchObject({ text: "Search", type: "callback" });
       expect(msg.buttons![0][0].data).toEqual(Buffer.from("search"));
-      expect(msg.buttons![0][1]).toMatchObject({ text: "Site", type: "url" });
-      expect(msg.buttons![1][0]).toMatchObject({ text: "Share", type: "switch_inline" });
+      expect(msg.buttons![0][1]).toMatchObject({
+        text: "Site",
+        type: "url",
+        url: "https://example.com",
+      });
+      expect(msg.buttons![1][0]).toMatchObject({
+        text: "Share",
+        type: "switch_inline",
+        query: "invite",
+        samePeer: true,
+      });
+    });
+
+    it("treats only plain reply keyboard buttons as commands", async () => {
+      const bridge = new GramJSUserBridge({
+        apiId: 1,
+        apiHash: "hash",
+        phone: "123",
+        sessionPath: "/tmp/fake",
+      });
+      const handler = vi.fn();
+      bridge.onNewMessage(handler);
+
+      const newMsgHandler = mockClient.addNewMessageHandler.mock.calls[0][0];
+      await newMsgHandler({
+        message: new Api.Message({
+          id: 8,
+          date: 1,
+          peerId: new Api.PeerUser({ userId: toLong(555n) }),
+          replyMarkup: new Api.ReplyKeyboardMarkup({
+            rows: [
+              new Api.KeyboardButtonRow({
+                buttons: [
+                  new Api.KeyboardButton({ text: "Search" }),
+                  new Api.KeyboardButtonRequestPhone({ text: "Share phone" }),
+                ],
+              }),
+            ],
+          }),
+        }),
+      } as NewMessageEvent);
+
+      const msg = handler.mock.calls[0][0] as TelegramMessage;
+      expect(msg.buttons![0][0]).toMatchObject({
+        text: "Search",
+        command: "Search",
+        type: "command",
+      });
+      expect(msg.buttons![0][1]).toMatchObject({ text: "Share phone", type: "unknown" });
+      expect(msg.buttons![0][1].command).toBeUndefined();
+
+      const ok = await bridge.clickButton("555", 8, msg.buttons![0][1]);
+      expect(ok).toBe(false);
+      expect(mockClient.sendMessageLowLevel).not.toHaveBeenCalled();
     });
   });
 

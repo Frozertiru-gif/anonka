@@ -296,6 +296,20 @@ describe("MessageHandler", () => {
       expect(ctx.isAnonBot).toBe(true);
     });
 
+    it("routes configured anonymous bot to subscribers once without calling AgentRuntime", async () => {
+      const { handler, agent } = createHandler({ anon_bot_user_id: 555 });
+      const subscriber = vi.fn();
+      handler.subscribeAnonBotMessages(subscriber);
+
+      const message = makeMessage({ id: 556, senderId: 555, isBot: true });
+      await handler.handleMessage(message);
+      await handler.handleMessage(message);
+
+      expect(subscriber).toHaveBeenCalledTimes(1);
+      expect(subscriber).toHaveBeenCalledWith(message);
+      expect(agent.processMessage).not.toHaveBeenCalled();
+    });
+
     it("other bot with different id is still blocked", () => {
       const { handler } = createHandler({ dm_policy: "open", anon_bot_user_id: 555 });
       const ctx = handler.analyzeMessage(makeMessage({ isBot: true, senderId: 999 }));

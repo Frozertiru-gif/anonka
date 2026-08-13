@@ -32,6 +32,12 @@ export interface TelegramMessage {
 export interface ParsedButton {
   text: string;
   data?: Buffer;
+  /** Destination preserved from Telegram's KeyboardButtonUrl. */
+  url?: string;
+  /** Inline query preserved from Telegram's KeyboardButtonSwitchInline. */
+  query?: string;
+  /** Whether a switch-inline query targets the current peer. */
+  samePeer?: boolean;
   command?: string;
   type: "callback" | "command" | "url" | "switch_inline" | "unknown";
 }
@@ -108,6 +114,14 @@ export interface ChatInfo {
   username?: string;
 }
 
+/** Bounded, oldest-first-paginated history retrieval for a creator Vault. */
+export interface HistoryScanOptions {
+  /** Maximum messages to read. Defaults to 1,000. */
+  limit?: number;
+  /** Telegram page size. Clamped to 1..100. */
+  batchSize?: number;
+}
+
 export interface ITelegramBridge {
   // Lifecycle
   connect(): Promise<void>;
@@ -122,6 +136,7 @@ export interface ITelegramBridge {
 
   // Messages
   getMessages(chatId: string, limit: number): Promise<TelegramMessage[]>;
+  scanHistory(chatId: string, options?: HistoryScanOptions): Promise<TelegramMessage[]>;
   sendMessage(options: SendMessageOptions): Promise<SentMessage>;
   editMessage(options: EditMessageOptions): Promise<SentMessage>;
   deleteMessage(chatId: string, messageId: number): Promise<boolean>;
