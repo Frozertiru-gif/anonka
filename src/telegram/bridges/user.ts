@@ -955,13 +955,17 @@ export class GramJSUserBridge implements ITelegramBridge {
 
     const { senderUsername, senderFirstName, isBot } = await this.resolveSender(msg);
 
+    // GramJS exposes video notes through the generic `video` convenience
+    // getter too. Check the round-video marker first so a video note does not
+    // silently degrade to an ordinary video at the transport boundary.
+    const isVideoNote = (msg as unknown as { videoNote?: unknown }).videoNote ?? msg.videoNote;
     const { hasMedia, mediaType } = classifyMedia({
       photo: msg.photo,
-      video: msg.video,
+      video: isVideoNote ? undefined : msg.video,
       audio: msg.audio,
       voice: msg.voice,
       sticker: msg.sticker,
-      video_note: (msg as unknown as { videoNote?: unknown }).videoNote ?? msg.videoNote,
+      video_note: isVideoNote,
       document: msg.document,
     });
 

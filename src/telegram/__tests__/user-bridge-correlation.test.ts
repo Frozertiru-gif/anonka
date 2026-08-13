@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Api, errors } from "telegram";
 import { toLong } from "../../utils/gramjs-bigint";
 import { outgoingTracker } from "../outgoing-tracker";
+import { GiftLedger } from "../../domain/commerce/gift-ledger";
+import { routeGiftMessage } from "../gift-routing";
 
 // Mock the TelegramUserClient module used by GramJSUserBridge.
 const mockClient = {
@@ -22,6 +24,7 @@ const mockClient = {
   forwardMessagesLowLevel: vi.fn(),
   getMessages: vi.fn(),
   addServiceMessageHandler: vi.fn(),
+  addNewMessageHandler: vi.fn(),
   getEntity: vi.fn(),
 };
 
@@ -39,6 +42,7 @@ vi.mock("../client.js", () => {
     forwardMessagesLowLevel = mockClient.forwardMessagesLowLevel;
     getMessages = mockClient.getMessages;
     addServiceMessageHandler = mockClient.addServiceMessageHandler;
+    addNewMessageHandler = mockClient.addNewMessageHandler;
     getEntity = mockClient.getEntity;
   }
   return { TelegramUserClient: MockTelegramUserClient };
@@ -216,6 +220,89 @@ describe("GramJSUserBridge — outgoing correlation", () => {
       expect.objectContaining({ file: Buffer.from("video"), videoNote: true, forceDocument: false })
     );
     expect(sendLowLevel.mock.calls[0][1]).not.toHaveProperty("fromPeer");
+  });
+
+  it("transport preserves photo, video, and video-note receive semantics", async () => {
+    const incoming = (id: number) => {
+      const message = new Api.Message({
+        id,
+        date: 1,
+        peerId: new Api.PeerUser({ userId: toLong(222) }),
+      });
+      for (const key of ["photo", "video", "videoNote", "audio", "voice", "sticker", "document"]) {
+        Object.defineProperty(message, key, { value: false, configurable: true });
+      }
+      return message;
+    };
+    const photo = incoming(1);
+    const video = incoming(2);
+    const note = incoming(3);
+    // The bridge reads GramJS convenience getters. Model those getters
+    // directly so this remains a transport test rather than a photo codec test.
+    Object.defineProperty(photo, "photo", { value: true });
+    Object.defineProperty(video, "video", { value: true });
+    Object.defineProperty(note, "video", { value: true });
+    Object.defineProperty(note, "videoNote", { value: true });
+    const getMessages = mockClient.getMessages as ReturnType<typeof vi.fn>;
+    getMessages.mockReset();
+    getMessages
+      .mockResolvedValueOnce([photo])
+      .mockResolvedValueOnce([video])
+      .mockResolvedValueOnce([note]);
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await expect((bridge as any).parseMessage(photo)).resolves.toMatchObject({
+      mediaType: "photo",
+      hasMedia: true,
+    });
+    await expect(bridge.getMessages("chat", 1)).resolves.toMatchObject([
+      { mediaType: "photo", hasMedia: true },
+    ]);
+    await expect(bridge.getMessages("chat", 1)).resolves.toMatchObject([
+      { mediaType: "video", hasMedia: true },
+    ]);
+    await expect(bridge.getMessages("chat", 1)).resolves.toMatchObject([
+      { mediaType: "video_note", hasMedia: true },
+    ]);
+  });
+
+  it("sendVideo and sendVideoNote retain distinct MTProto media attributes", async () => {
+    const buildInputMedia = mockClient.buildInputMedia as ReturnType<typeof vi.fn>;
+    buildInputMedia.mockResolvedValue(new Api.InputMediaDice({ emoticon: "🎲" }));
+    const sendLowLevel = mockClient.sendMediaLowLevel as ReturnType<typeof vi.fn>;
+    sendLowLevel.mockImplementation(async (_chatId: string, options: { randomId: bigint }) =>
+      makeUpdatesResult(options.randomId, 250)
+    );
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+
+    await bridge.sendVideo("chat", Buffer.from("video"), { duration: 9, width: 100, height: 200 });
+    await bridge.sendVideoNote("chat", Buffer.from("note"), { duration: 5 });
+
+    expect(buildInputMedia.mock.calls[0][0].attributes[0]).toMatchObject({
+      roundMessage: false,
+      supportsStreaming: true,
+      duration: 9,
+      w: 100,
+      h: 200,
+    });
+    expect(buildInputMedia.mock.calls[1][0]).toMatchObject({
+      videoNote: true,
+      forceDocument: false,
+    });
+    expect(buildInputMedia.mock.calls[1][0].attributes[0]).toMatchObject({
+      roundMessage: true,
+      duration: 5,
+    });
   });
 
   it("sendMessage: manual outgoing in the same chat is NOT stolen by a pending send", async () => {
@@ -543,5 +630,41 @@ describe("GramJSUserBridge — outgoing correlation", () => {
     expect(message.giftEvent?.fromAnonymous).toBe(false);
     expect(message.giftEvent?.nameHidden).toBe(true);
     expect(message.giftEvent?.senderId).toBe("123");
+  });
+
+  it("Gift fixture flows from Telegram service event through bridge into GiftLedger", async () => {
+    const sender = new Api.PeerUser({ userId: toLong(123n) });
+    const gift = new Api.StarGift({
+      id: toLong(42n),
+      stars: toLong(50n),
+      convertStars: toLong(45n),
+      title: "Fixture gift",
+      sticker: new Api.Document({ id: toLong(1n) }),
+    });
+    const serviceMsg = new Api.MessageService({
+      id: 77,
+      date: 1700000000,
+      fromId: sender,
+      peerId: new Api.PeerUser({ userId: toLong(222n) }),
+      action: new Api.MessageActionStarGift({ gift, fromId: sender, nameHidden: false }),
+    });
+    const bridge = new GramJSUserBridge({
+      apiId: 1,
+      apiHash: "hash",
+      phone: "123",
+      sessionPath: "/tmp/fake",
+    });
+    const ledger = new GiftLedger((chatId) => (chatId === "222" ? "123" : undefined));
+    const decisions = vi.fn();
+
+    bridge.onServiceMessage((message) => routeGiftMessage(message, ledger, decisions));
+    const registered = (mockClient.addServiceMessageHandler as ReturnType<typeof vi.fn>).mock
+      .calls[0][0];
+    await registered(serviceMsg);
+
+    expect(decisions).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "CONFIRMED", source: "conversation" })
+    );
+    expect(ledger.credits().get("gift_received:222:77")).toEqual({ stars: "50" });
   });
 });

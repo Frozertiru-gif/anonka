@@ -55,6 +55,20 @@ export class TelegramAuthRequiredError extends Error {
   }
 }
 
+const INVALID_SESSION_ERROR_CODES = new Set([
+  "AUTH_KEY_UNREGISTERED",
+  "SESSION_REVOKED",
+  "SESSION_EXPIRED",
+  "AUTH_KEY_DUPLICATED",
+]);
+
+/** True only for Telegram's explicit evidence that the persisted session is unusable. */
+export function isInvalidTelegramSessionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { errorMessage?: unknown }).errorMessage;
+  return typeof code === "string" && INVALID_SESSION_ERROR_CODES.has(code);
+}
+
 export interface TelegramUser {
   id: bigint;
   username?: string;
@@ -247,8 +261,9 @@ export class TelegramUserClient {
         throw error;
       }
 
-      if (!interactive && this.authState !== "auth_required") {
-        // Non-interactive mode: session existed but failed to connect (expired/revoked)
+      if (!interactive && isInvalidTelegramSessionError(error)) {
+        // Only Telegram's explicit invalid-session codes become AUTH_REQUIRED.
+        // Transient transport failures must remain retryable errors.
         this.authState = "auth_required";
         log.warn(
           { err: error },

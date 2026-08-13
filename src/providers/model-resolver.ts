@@ -11,6 +11,35 @@ const modelCache = new Map<string, Model<Api>>();
 
 const GOCOON_MODELS: Record<string, Model<"openai-completions">> = {};
 
+const DEEPSEEK_MODELS: Record<string, Model<"openai-completions">> = {
+  "deepseek-v4-pro": {
+    id: "deepseek-v4-pro",
+    name: "DeepSeek V4 Pro",
+    api: "openai-completions",
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 384_000,
+    compat: { maxTokensField: "max_tokens" },
+  },
+  "deepseek-v4-flash": {
+    id: "deepseek-v4-flash",
+    name: "DeepSeek V4 Flash",
+    api: "openai-completions",
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 384_000,
+    compat: { maxTokensField: "max_tokens" },
+  },
+};
+
 const GROK_BUILD_MODEL_ID = "grok-build";
 
 function clearProviderModels(provider: SupportedProvider): void {
@@ -173,6 +202,13 @@ export function getProviderModel(provider: SupportedProvider, modelId: string): 
       return model;
     }
     throw new Error(`Model "${modelId}" is not served by the configured gocoon endpoint`);
+  }
+
+  if (provider === "deepseek") {
+    const model = DEEPSEEK_MODELS[modelId];
+    if (!model) throw new Error(`DeepSeek model "${modelId}" is not supported`);
+    modelCache.set(cacheKey, model);
+    return model;
   }
 
   if (meta.piAiProvider === "local") {

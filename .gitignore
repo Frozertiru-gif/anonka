@@ -26,6 +26,7 @@ wallet.json
 *.db
 telegram_session.txt
 telegram-offset.json
+.anonka/
 .reference/
 
 # Specs & working docs (local only)

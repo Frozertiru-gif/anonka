@@ -234,6 +234,18 @@ const MODEL_OPTIONS: Record<string, CatalogModelOption[]> = {
       description: "Small & fast, 131K ctx, $0.04/M",
     },
   ],
+  deepseek: [
+    {
+      value: "deepseek-v4-pro",
+      name: "DeepSeek V4 Pro",
+      description: "Direct DeepSeek API, reasoning, 1M context",
+    },
+    {
+      value: "deepseek-v4-flash",
+      name: "DeepSeek V4 Flash",
+      description: "Direct DeepSeek API, fast, 1M context",
+    },
+  ],
   moonshot: [
     {
       value: "kimi-for-coding",
