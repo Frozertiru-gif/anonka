@@ -23,10 +23,16 @@ $ProjectRoot = $PSScriptRoot
 $DataDirectory = Join-Path $ProjectRoot ".anonka"
 $ConfigPath = Join-Path $DataDirectory "config.yaml"
 $SessionDirectory = Join-Path $DataDirectory "sessions"
+$WorkspaceDirectory = Join-Path $DataDirectory "workspace"
 
 if (-not (Test-Path $ConfigPath)) {
   throw "Missing local configuration: $ConfigPath"
 }
+
+# Keep the legacy runtime's workspace/memory files beside this creator's local
+# config and session, rather than under the global C:\Users\D\.teleton path.
+$env:TELETON_HOME = $DataDirectory
+New-Item -ItemType Directory -Force -Path $DataDirectory, $SessionDirectory, $WorkspaceDirectory | Out-Null
 
 Push-Location $ProjectRoot
 try {
