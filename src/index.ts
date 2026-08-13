@@ -691,6 +691,19 @@ ${blue}  ┌──────────────────────�
           log.error({ err: error }, "Error enqueueing message");
         }
       });
+
+      // Edited messages (anon bot may rewrite its own messages) reach the same
+      // pipeline, preserving the original message id (isEdited=true).
+      this.bridge.onEditedMessage(async (message) => {
+        if (!this.acceptingMessages) return;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- debouncer always initialized before handlers register
+          await this.debouncer!.enqueue(message);
+        } catch (error) {
+          log.error({ err: error }, "Error enqueueing edited message");
+        }
+      });
+
       this.messageHandlersRegistered = true;
     }
   }

@@ -136,6 +136,17 @@ export const TelegramConfigSchema = z
       .boolean()
       .default(false)
       .describe("Allow the bot to answer guest queries in chats it is not a member of"),
+    anon_bot_user_id: z
+      .number()
+      .nullable()
+      .default(null)
+      .describe(
+        "Stable Telegram bot user id of the configured anonymous-chat bot. Messages from this bot pass the bot filter; all other bots are ignored. username is display-only."
+      ),
+    anon_bot_username: z
+      .string()
+      .optional()
+      .describe("Anonymous bot username (display/debug only, not used as identity key)"),
   })
   .superRefine((data, ctx) => {
     if (data.mode === "user") {

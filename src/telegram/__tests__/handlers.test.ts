@@ -76,6 +76,7 @@ function makeConfig(overrides: Partial<TelegramConfig> = {}): TelegramConfig {
     typing_simulation: false,
     rate_limit_messages_per_second: 30,
     rate_limit_groups_per_minute: 20,
+    anon_bot_user_id: null,
     ...overrides,
   } as TelegramConfig;
 }
@@ -283,6 +284,35 @@ describe("MessageHandler", () => {
     it("isBot=true → shouldRespond=false", () => {
       const { handler } = createHandler({ dm_policy: "open" });
       const ctx = handler.analyzeMessage(makeMessage({ isBot: true }));
+      expect(ctx.shouldRespond).toBe(false);
+      expect(ctx.reason).toBe("Sender is a bot");
+    });
+
+    it("configured anonymous bot passes the bot filter (isAnonBot=true)", () => {
+      const { handler } = createHandler({ dm_policy: "open", anon_bot_user_id: 555 });
+      const ctx = handler.analyzeMessage(makeMessage({ isBot: true, senderId: 555 }));
+      expect(ctx.shouldRespond).toBe(false);
+      expect(ctx.reason).toBe("Anonymous bot");
+      expect(ctx.isAnonBot).toBe(true);
+    });
+
+    it("other bot with different id is still blocked", () => {
+      const { handler } = createHandler({ dm_policy: "open", anon_bot_user_id: 555 });
+      const ctx = handler.analyzeMessage(makeMessage({ isBot: true, senderId: 999 }));
+      expect(ctx.shouldRespond).toBe(false);
+      expect(ctx.reason).toBe("Sender is a bot");
+      expect(ctx.isAnonBot).toBeUndefined();
+    });
+
+    it("human DM is unaffected when anon bot is configured", () => {
+      const { handler } = createHandler({ dm_policy: "open", anon_bot_user_id: 555 });
+      const ctx = handler.analyzeMessage(makeMessage({ senderId: 222, isBot: false }));
+      expect(ctx.shouldRespond).toBe(true);
+    });
+
+    it("no anon bot configured → all bots blocked", () => {
+      const { handler } = createHandler({ dm_policy: "open" });
+      const ctx = handler.analyzeMessage(makeMessage({ isBot: true, senderId: 555 }));
       expect(ctx.shouldRespond).toBe(false);
       expect(ctx.reason).toBe("Sender is a bot");
     });

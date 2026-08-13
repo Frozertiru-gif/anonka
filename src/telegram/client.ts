@@ -562,6 +562,19 @@ export class TelegramUserClient {
     });
   }
 
+  /**
+   * Narrow raw-update escape hatch for the future AnonAdapter.
+   *
+   * Receives typed Api.TypeUpdate objects (not arbitrary raw Telegram API)
+   * so an adapter can observe protocol signals that do not fit the DTO.
+   */
+  addRawUpdateHandler(handler: (update: Api.TypeUpdate) => void | Promise<void>): void {
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises -- GramJS event handler accepts async
+    this.client.addEventHandler(async (update) => {
+      await handler(update as Api.TypeUpdate);
+    });
+  }
+
   async getMessages(
     entity: string | Api.TypePeer,
     options?: {

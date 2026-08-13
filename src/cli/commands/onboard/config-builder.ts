@@ -84,6 +84,7 @@ export function buildConfig(input: BuildConfigInput): Config {
       bot_username: input.botUsername,
       stream_mode: "all",
       guest_mode: false,
+      anon_bot_user_id: null,
     },
     storage: {
       sessions_file: `${input.workspaceRoot}/sessions.json`,

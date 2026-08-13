@@ -56,6 +56,8 @@ export interface MessageContext {
   isAdmin: boolean;
   shouldRespond: boolean;
   reason?: string;
+  /** True when the message came from the configured anonymous-chat bot. */
+  isAnonBot?: boolean;
 }
 
 class RateLimiter {
@@ -291,6 +293,18 @@ export class MessageHandler {
     }
 
     if (message.isBot) {
+      // Narrow allowlist exception: the configured anonymous-chat bot passes
+      // through to processing (future AnonAdapter); every other bot is ignored.
+      const anonBotId = this.config.anon_bot_user_id;
+      if (anonBotId !== null && anonBotId !== undefined && message.senderId === anonBotId) {
+        return {
+          message,
+          isAdmin,
+          shouldRespond: false,
+          reason: "Anonymous bot",
+          isAnonBot: true,
+        };
+      }
       return {
         message,
         isAdmin,

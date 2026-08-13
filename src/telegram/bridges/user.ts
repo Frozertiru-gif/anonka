@@ -754,6 +754,15 @@ export class GramJSUserBridge implements ITelegramBridge {
     });
   }
 
+  /**
+   * Narrow raw-update subscription for the future AnonAdapter. Receives
+   * typed Api.TypeUpdate objects without leaking arbitrary raw API into the
+   * application layer.
+   */
+  onRawUpdate(handler: (update: Api.TypeUpdate) => void | Promise<void>): void {
+    this.client.addRawUpdateHandler(handler);
+  }
+
   /** Resolve sender username/firstName/bot flag with a timeout; non-fatal on failure. */
   private async resolveSender(
     msg: Api.Message | Api.MessageService
@@ -791,7 +800,7 @@ export class GramJSUserBridge implements ITelegramBridge {
     try {
       if (markup instanceof Api.ReplyInlineMarkup) {
         return markup.rows.map((row: Api.KeyboardButtonRow) =>
-          row.buttons.map((btn) => {
+          row.buttons.map((btn: Api.TypeKeyboardButton) => {
             if (btn instanceof Api.KeyboardButtonCallback) {
               return {
                 text: btn.text,
@@ -811,6 +820,14 @@ export class GramJSUserBridge implements ITelegramBridge {
                 type: "switch_inline" as const,
               };
             }
+            if (btn instanceof Api.KeyboardButton) {
+              // Plain inline text button: clicking sends its literal text.
+              return {
+                text: btn.text,
+                command: btn.text,
+                type: "command" as const,
+              };
+            }
             return {
               text: (btn as { text?: string }).text ?? "?",
               type: "unknown" as const,
@@ -821,11 +838,13 @@ export class GramJSUserBridge implements ITelegramBridge {
 
       if (markup instanceof Api.ReplyKeyboardMarkup) {
         return markup.rows.map((row: Api.KeyboardButtonRow) =>
-          row.buttons.map((btn) => {
+          row.buttons.map((btn: Api.TypeKeyboardButton) => {
+            // A reply keyboard button is a text command: the button's literal
+            // text is what gets sent on tap. No "/" fabrication.
             const text = (btn as { text?: string }).text ?? "?";
             return {
               text,
-              command: text.startsWith("/") ? text : `/${text.toLowerCase().replace(/\s+/g, "_")}`,
+              command: text,
               type: "command" as const,
             };
           })
