@@ -11,6 +11,6 @@
       "project": ["src/**/*.{ts,tsx}"]
     }
   },
-  "ignoreDependencies": ["@grammyjs/types"],
+  "ignoreDependencies": ["@grammyjs/types", "lint-staged"],
   "ignoreExportsUsedInFile": true
 }
