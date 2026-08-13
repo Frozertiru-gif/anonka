@@ -205,6 +205,22 @@ Telegram event
 - `src/application/response-scheduler.ts`
 - `src/application/action-coordinator.ts`
 
+### Фактическое состояние и безопасное переключение
+
+Текущий `MessageHandler` остаётся рабочим **legacy path** только до переключения:
+
+```text
+Telegram event
+→ legacy raw feed
+→ MessageHandler
+→ AgentRuntime.processMessage()
+→ generic tools / response
+```
+
+Его RAM-dedupe по `chatId:messageId`, файловый offset и rate limiter, который пропускает сообщения при лимите, не являются частью нового core. В частности, edited update с тем же `chatId:messageId` нельзя считать duplicate нового Inbox.
+
+Phase 1 добавляет отдельный single-creator customer entrypoint рядом с legacy runtime. Новый ingress получает нормализованные bridge events, классифицирует их через `TransportRouter`, сначала фиксирует Inbox и только затем обновляет transport offset. Старый путь не удаляется и не переписывается «на месте» до прохождения Phase-1 test gates.
+
 ---
 
 ## 3.2. SQLite / old memory layer
@@ -241,7 +257,10 @@ Telegram event
 
 - `src/storage/sqlite-primitives.ts`
 - `src/storage/creator-db.ts`
-- `src/supervisor/storage/supervisor-db.ts`
+
+- `src/supervisor/storage/supervisor-db.ts` относится к Phase 2 и не входит в первый deterministic core.
+
+`sqlite-primitives.ts` — небольшой foundation, а не второй ORM: открыть creator-scoped путь, создать директорию, применить безопасные права, WAL/`foreign_keys`/нужные PRAGMA и транзакционные migrations. `CreatorDatabase` получает собственную schema version и никогда не открывает старый global `memory.db` как source of truth.
 
 ### Целевые DB
 
@@ -284,6 +303,8 @@ prompt требует JSON
 ```
 
 Text-only fallback не имеет права запускать media/offer/handoff/payment side effects.
+
+`AnonkaLLMService` вызывает provider stack без `AgentRuntime`, generic tools, plugin/MCP/TON context и legacy transcript persistence. Из `src/soul/loader.ts` можно извлечь только безопасное чтение creator-файлов, cache и sanitization; старый Teleton system prompt и global MEMORY/USER/IDENTITY в customer path не входят.
 
 ---
 
@@ -415,6 +436,14 @@ Text-only fallback не имеет права запускать media/offer/han
 - callback storage.
 
 Long-lived callbacks должны храниться в `supervisor.db`, а не только RAM.
+
+---
+
+## 3.8. Контракт Outbox transport boundary
+
+Concrete `GramJSUserBridge` уже умеет отправку с сохранённым MTProto `random_id`, но этот параметр должен быть доступен и через typed application-facing bridge contract. Перед Outbox нужно добавить явный outbox-send API либо расширить `ITelegramBridge` для text/photo/video/video_note/copy.
+
+Нельзя обходить это приведением типа к concrete `GramJSUserBridge`: durable Outbox обязан передавать свой сохранённый correlation key через интерфейс и повторно использовать его после restart.
 
 ---
 
@@ -887,6 +916,10 @@ SDK как публичный Teleton product Anonka не нужен.
 
 Порядок:
 
+Это **implementation order**, а не порядок обработки одного Telegram update. Runtime порядок остаётся: `normalized event → TransportRouter → durable Inbox commit → transport offset → Inbox processing`.
+
+До начала обработки Inbox router обязан различать как минимум `message_created`, `message_edited`, service/raw event и outgoing event. Поэтому edit с тем же Telegram message id не конфликтует с исходным сообщением: `event_type` входит в idempotency key.
+
 1. `sqlite-primitives.ts`.
 2. `CreatorDatabase` + migrations.
 3. durable Inbox.
@@ -905,6 +938,31 @@ SDK как публичный Teleton product Anonka не нужен.
 ### После этого
 
 Customer message больше не должен идти через старый `AgentRuntime`.
+
+### Чёткие границы Phase 1
+
+В Phase 1 нужен минимальный logical `conversation_id`, creator-scoped mapping и version для queue/stale guards. Полные canonical `conversation_messages`, facts, summaries, creator manual history и anon → DM continuity остаются Phase 3.
+
+Не включать сюда `SupervisorDatabase`, registry, OS-process isolation, IPC, Control Bot и crash-loop management: это Phase 2. Media Vault не переносится из transport spike в domain catalog до Phase 4; durable Gift/Offer state — до Phase 5.
+
+### Phase-1 test gates
+
+До переключения customer path должны быть доказаны отдельными тестами:
+
+```text
+Inbox duplicate → one durable record / one logical turn
+Inbox commit succeeds before offset advances
+stale processing recovers after crash
+edited event and original message are distinct event types
+multi-message logical batch → one LLM turn
+same conversation serial / different conversations bounded-concurrent
+invalid ChatDecision → one repair → text-only fallback with no side effects
+technical LLM failure does not expose internals to customer
+Outbox row + correlation commit before bridge send
+accepted-send/crash restart reuses the same random_id
+FloodWait waits or retries; customer event is never dropped
+graceful drain finishes accepted Inbox/Outbox work
+```
 
 ---
 

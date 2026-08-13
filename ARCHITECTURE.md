@@ -119,6 +119,12 @@ src/telegram/debounce.ts
 
 Не сохраняем текущий decision wiring `MessageHandler → AgentRuntime`.
 
+### Переходный контракт
+
+`MessageHandler` остаётся legacy runtime до доказанного переключения, но не становится `TransportRouter` через постепенное добавление новых веток. Он опирается на RAM-dedupe по `chatId:messageId`, legacy raw feed, файловый transport offset и policy, которая может пропустить событие при rate limit.
+
+Новый single-creator customer path подписывается на те же нормализованные bridge events отдельно: классифицирует event, пишет durable Inbox, коммитит его и только после этого продвигает offset. Это сохраняет работающий Phase-0 runtime до прохождения Phase-1 test gates и не смешивает два источника business truth.
+
 ## 3.2. Telegram Bot API infrastructure
 
 Переиспользуем:
@@ -984,7 +990,7 @@ AI ведёт conversation, но creator может вмешиваться. Manu
 LLM может вернуть только semantic intent:
 
 ```json
-{"handoff_intent":"offer"}
+{ "handoff_intent": "offer" }
 ```
 
 Код:
@@ -1035,6 +1041,8 @@ UNIQUE(creator_id, event_type, telegram_chat_id, telegram_message_id)
 
 Для service/raw events без message id используется стабильный `transport_event_key`.
 
+`event_type` обязателен и различает как минимум `message_created`, `message_edited`, service/raw и outgoing события. Поэтому edit существующего Telegram message не поглощается dedupe исходного `message_created`. Для каждого event без Telegram message id используется стабильный `transport_event_key`; он также участвует в уникальности соответствующего event kind.
+
 Правильный ingestion:
 
 ```text
@@ -1052,6 +1060,8 @@ Telegram event
 `telegram-offset.json`/offset-store — только transport watermark/optimization.
 
 Он **не является source of truth** для «business event уже обработан».
+
+Legacy `tg_messages` и RAM set также не являются Inbox: они могут оставаться raw/debug feed до следующих фаз, но не дают crash recovery, status/attempts и creator-scoped idempotency.
 
 ---
 
@@ -1104,6 +1114,8 @@ create Outbox row
 
 Для MTProto использовать `random_id` или другой стабильный client-generated primitive там, где он поддерживается.
 
+Concrete GramJS transport уже поддерживает `random_id` для text/photo/video/video_note/copy. Phase 1 обязан поднять эту возможность в typed bridge boundary через явный outbox-send API или расширение `ITelegramBridge`; Outbox не приводит bridge к concrete user class и не генерирует новый id при recovery.
+
 Это необходимо для:
 
 - manual-vs-programmatic outgoing detection;
@@ -1137,6 +1149,8 @@ incoming Inbox events
 → one logical batch
 ```
 
+Существующий `MessageDebouncer` пригоден только как донор timer mechanics: он key-ится по physical `chatId`, обычно обслуживает groups и вызывает обработчик для каждого сообщения. Новый debouncer собирает один batch по `conversation_id` и передаёт его одному turn.
+
 ## 17.2. ConversationQueue
 
 Идею Teleton `ChatQueue` переиспользуем, но domain lock key = `conversation_id`.
@@ -1151,6 +1165,8 @@ room_generation guard
 AbortController
 graceful drain
 ```
+
+Rate-limit/FloodWait не удаляет accepted Inbox event: работа ждёт или остаётся retryable в durable state. Bounded concurrency ограничивает активную работу, а не надёжность уже принятого customer event.
 
 ## 17.3. Human-like ResponseScheduler
 
@@ -1194,6 +1210,8 @@ ContextBuilder
 Fallback — только при технических сбоях.
 
 Не использовать fallback для обхода refusal/safety behavior провайдера.
+
+`AnonkaLLMService` использует существующие provider/model-request primitives без `AgentRuntime`, generic tool registry, plugin/MCP/TON context и legacy transcript persistence. Старый Teleton prompt не переносится: из soul loader допускаются только безопасное чтение creator persona/strategy/security файлов, cache и sanitization.
 
 ## 18.2. ChatDecision
 
@@ -2068,6 +2086,14 @@ src/prompts/
 - rate-limit waits, not drops;
 - LLM failure не раскрывается customer;
 - graceful worker lifecycle/drain.
+
+Порядок списка — implementation order. Runtime order для одного update: `normalized event → TransportRouter → Inbox commit → offset → Inbox processing`. Router маркирует `message_created`, `message_edited`, service/raw и outgoing события до Inbox dedupe.
+
+Phase 1 запускается как отдельный single-creator runtime рядом с legacy `TeletonApp`; переключать customer traffic можно только после test gates. `TeletonApp`, `MemoryDatabase`/`memory.db` и old session/transcript pipeline не являются частями нового core.
+
+В Phase 1 входят только minimal conversation identity/mapping/version, нужные для router, queue и stale guards. Полная canonical history/facts/summaries/manual integration/anon→DM — Phase 3; Supervisor/CreatorWorker/IPC/Control Bot — Phase 2; Media Vault — Phase 4; durable Gifts/Offers — Phase 5.
+
+Минимальные Phase-1 gates: Inbox duplicate/commit-before-offset/recovery; edited event отдельно от original; logical batch → one LLM turn; bounded per-conversation queue; one repair then side-effect-free fallback; no customer disclosure of technical LLM failure; durable Outbox with persisted correlation/recovery; FloodWait wait/retry; graceful drain.
 
 ## Phase 2 — Supervisor + CreatorWorker + Control Bot
 
